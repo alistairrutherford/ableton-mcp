@@ -15,6 +15,11 @@ substring match).
 import re
 import time
 
+try:  # in Live: the ClaudeLiveBridge package
+    from .indexer import INDEX, ROOTS as INDEX_ROOTS, item_id
+except ImportError:  # in tests: imported as top-level modules
+    from indexer import INDEX, ROOTS as INDEX_ROOTS, item_id
+
 MONITORING ={"in": 0, "auto": 1, "off": 2}
 MONITORING_NAMES = {v: k for k, v in MONITORING.items()}
 
@@ -90,6 +95,10 @@ class Commands:
 
     def names(self):
         return sorted(n[4:] for n in dir(self) if n.startswith("cmd_"))
+
+    def tick(self):
+        """Called from the control surface's update tick, after the socket: background work."""
+        INDEX.step()
 
     def dispatch(self, cmd, args):
         fn = getattr(self, "cmd_" + str(cmd), None)
@@ -498,6 +507,7 @@ class Commands:
         before = len(t.devices)
         s.view.selected_track = t
         if scene is not None:
+            self._show_session()
             s.view.highlighted_clip_slot = list(t.clip_slots)[int(scene)]
         devices_before = [self._device_info(d, i) for i, d in enumerate(t.devices)]
         self._app().browser.load_item(hit["_item"])
@@ -828,6 +838,114 @@ class Commands:
                     "level": _safe(lambda: m.output_meter_level)})
         return out
 
+    # -- the browser index (Phase 2) -------------------------------------------
+
+    def cmd_index_start(self, roots=None, budget_ms=None):
+        """Start (or restart) indexing the browser, a few ms per tick (see indexer.py). Poll
+        index_status until state is "done", then read it with index_page."""
+        if budget_ms is not None:
+            if not 1 <= float(budget_ms) <= 200:
+                raise CommandError("budget_ms must be 1..200")
+            INDEX.budget_ms = float(budget_ms)
+        try:
+            INDEX.start(self._app().browser, roots)
+        except ValueError as e:
+            raise CommandError(str(e))
+        return INDEX.status()
+
+    def cmd_index_status(self):
+        return INDEX.status()
+
+    def cmd_index_page(self, offset=0, limit=2000):
+        return INDEX.page(int(offset), int(limit))
+
+    def cmd_index_fingerprint(self):
+        """What a cached index depends on, cheap to read: Live's version and the top level of the
+        browser roots that change when content is installed or added (packs, User Library,
+        added folders)."""
+        b = self._app().browser
+        top = lambda item: [c.name for c in _safe(lambda: list(item.children), [])]
+        return {"live_version": self.cmd_ping()["live_version"],
+                "packs": top(b.packs), "user_library": top(b.user_library),
+                "user_folders": [f.name for f in _safe(lambda: list(b.user_folders), [])]}
+
+    def _resolve(self, id, root=None, path=None):
+        """The browser item for an index id: from the index if it holds it, else by walking
+        `root` down `path` (an index read from a cache, after Live restarted)."""
+        item = INDEX.items.get(id)
+        if item is not None:
+            return item
+        if root is None or not path:
+            raise CommandError("unknown browser id %r: give its root and path, or rebuild the index" % (id,))
+        if root not in INDEX_ROOTS:
+            raise CommandError("root must be one of %s" % (INDEX_ROOTS,))
+        if root == "user_folders":
+            item = _match(_safe(lambda: list(self._app().browser.user_folders), []), path[0],
+                          lambda c: c.name, "user folder")
+            rest = path[1:]
+        else:
+            item, rest = getattr(self._app().browser, root), path
+        for name in rest:
+            kids = _safe(lambda: list(item.children), [])
+            exact = [c for c in kids if c.name == name]
+            if not exact:
+                raise CommandError("%r is no longer in the browser at %s/%s; rebuild the index" % (
+                    id, root, "/".join(path)))
+            item = exact[0]
+        if item_id(item, root, path) != id:
+            raise CommandError("the browser item at %s/%s is no longer %r; rebuild the index" % (
+                root, "/".join(path), id))
+        INDEX.items[id] = item
+        return item
+
+    VIEWS = ("Session", "Arranger", "Browser", "Detail", "Detail/Clip", "Detail/DeviceChain")
+
+    def cmd_view_state(self):
+        """Which of Live's main views are showing (Application.View.is_view_visible)."""
+        view = self._app().view
+        return {name: _safe(lambda name=name: bool(view.is_view_visible(name))) for name in self.VIEWS}
+
+    def _show_session(self):
+        """Bring Session view to the front if it isn't showing; returns whether it had to. Live
+        puts an item loaded onto an audio track into the highlighted clip slot only in Session
+        view (in Arrangement view the load does nothing)."""
+        view = self._app().view
+        if _safe(lambda: bool(view.is_view_visible("Session")), True):
+            return False
+        view.show_view("Session")
+        return True
+
+    def cmd_load_item(self, id, track, root=None, path=None, scene=None):
+        """Load an index entry onto a track, as a double-click would: devices and presets go on the
+        track (an instrument replaces the track's instrument), a sample goes into a Simpler on a
+        MIDI track or into clip slot `scene` on an audio track. Returns what the client needs to
+        wait for the result: the devices and the slot before, and the tempo (a loop can change it)."""
+        item = self._resolve(id, root, path)
+        t = self._track(track)
+        s = self._song()
+        slot_before = None
+        showed_session = False
+        s.view.selected_track = t
+        if scene is not None:
+            slots = list(t.clip_slots)
+            if not 0 <= int(scene) < len(slots):
+                raise CommandError("scene %s out of range (0..%d)" % (scene, len(slots) - 1))
+            slot_before = bool(slots[int(scene)].has_clip)
+            showed_session = self._show_session()
+            s.view.highlighted_clip_slot = slots[int(scene)]
+        devices_before = [self._device_info(d, i) for i, d in enumerate(t.devices)]
+        tempo_before = s.tempo
+        self._app().browser.load_item(item)
+        return {"track": self._track_index(t), "id": id, "name": item.name,
+                "devices_before": devices_before, "scene": scene, "slot_had_clip": slot_before,
+                "showed_session_view": showed_session, "tempo_before": tempo_before}
+
+    def cmd_preview_item(self, id, root=None, path=None):
+        """Audition a browser item (a sample, or a preset with a preview) through Live's preview."""
+        item = self._resolve(id, root, path)
+        self._app().browser.preview_item(item)
+        return {"previewing": id, "name": item.name}
+
     # -- Phase 0 spikes: probing the LOM (see docs/spikes.md) ----------------
 
     def _lom_target(self, target, track=None, category=None, path=None):
@@ -900,15 +1018,6 @@ class Commands:
         out = {k: v for k, v in w.items() if k != "stack"}
         out.update(category=category, done=not stack, pending=len(stack))
         return out
-
-    def cmd_preview_item(self, name, category="samples"):
-        hits = self._search(name, category)
-        exact = [h for h in hits if h["exact"]]
-        pool = exact or hits
-        if not pool:
-            raise CommandError("nothing named %r in browser.%s" % (name, category))
-        self._app().browser.preview_item(pool[0]["_item"])
-        return {"previewing": self._public(pool[0])}
 
     def cmd_stop_preview(self):
         self._app().browser.stop_preview()

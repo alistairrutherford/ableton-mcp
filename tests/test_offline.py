@@ -6,6 +6,7 @@ import time
 import pytest
 
 import commands as bridge_commands
+import indexer as bridge_indexer
 import server as bridge_server
 from livebridge import livelog, timing
 from livebridge.client import BridgeError, LiveClient
@@ -40,13 +41,22 @@ class Clip(Obj):
         return [n for n in self._notes if from_time <= n.start_time < from_time + time_span]
 
 
+class ClipSlot(Obj):
+    def __init__(self, clip=None):
+        super().__init__(clip=clip, is_recording=False, is_playing=False)
+
+    @property
+    def has_clip(self):
+        return self.clip is not None
+
+
 class Track(Obj):
     def __init__(self, name, devices=(), **kw):
         kw.setdefault("has_midi_input", True)
         kw.setdefault("can_be_armed", True)
         super().__init__(name=name, devices=list(devices), color=0x1AFF2F, color_index=0, is_foldable=False,
                          arm=False, current_monitoring_state=1, mute=False, solo=False,
-                         playing_slot_index=-1, arrangement_clips=[], clip_slots=[],
+                         playing_slot_index=-1, arrangement_clips=[], clip_slots=[ClipSlot() for _ in range(4)],
                          output_meter_left=0.0, output_meter_right=0.0, output_meter_level=0.0,
                          available_input_routing_types=[], available_input_routing_channels=[],
                          input_routing_type=None, input_routing_channel=None,
@@ -63,7 +73,7 @@ class Song(Obj):
                          current_song_time=0.0, record_mode=False, session_record=False,
                          is_counting_in=False, arrangement_overdub=False, loop=False,
                          metronome=False, midi_recording_quantization="rec_q_no_q",
-                         view=Obj(selected_track=None))
+                         view=Obj(selected_track=None, highlighted_clip_slot=None))
 
     def start_playing(self):
         self.is_playing = True
@@ -91,10 +101,29 @@ class Song(Obj):
         del self.return_tracks[index]
 
 
+class AppView(Obj):
+    """Application.View: starts in Arrangement view, like the 8-Track template set."""
+    def __init__(self):
+        super().__init__(visible="Arranger", shown=[])
+
+    def is_view_visible(self, name):
+        return name == self.visible
+
+    def show_view(self, name):
+        self.visible = name
+        self.shown.append(name)
+
+
 class BrowserItem(Obj):
-    def __init__(self, name, children=(), loadable=False, uri="", kind=None):
+    def __init__(self, name, children=(), loadable=False, uri="", kind=None, source="Core Library",
+                 is_device=None):
         super().__init__(name=name, children=list(children), is_loadable=loadable,
-                         is_device=loadable, uri=uri, kind=kind)
+                         is_device=loadable if is_device is None else is_device, uri=uri, kind=kind,
+                         source=source)
+
+    @property
+    def iter_children(self):
+        return iter(self.children)
 
 
 _ptrs = iter(range(1000, 10 ** 6))
@@ -136,27 +165,56 @@ def make_world():
             BrowserItem("Attack Pad.adv", loadable=True, kind="instrument")])]),
         drums=BrowserItem("Drums"),
         audio_effects=BrowserItem("Audio Effects", [BrowserItem("Reverb", loadable=True, kind="effect")]),
+        midi_effects=BrowserItem("MIDI Effects"),
+        max_for_live=BrowserItem("Max for Live"),
+        clips=BrowserItem("Clips"),
+        samples=BrowserItem("Samples", [
+            BrowserItem("Acoustic Kick Loop 86bpm.aif", loadable=True, is_device=False, kind="sample",
+                        uri="query:Samples#FileId_6889", source="Chop and Swing"),
+            BrowserItem("Snare One Shot.wav", loadable=True, is_device=False, kind="sample",
+                        uri="query:Samples#FileId_7001")]),
+        packs=BrowserItem("Packs", [BrowserItem("Chop and Swing", [BrowserItem("Samples", [
+            BrowserItem("Acoustic Kick Loop 86bpm.aif", loadable=True, is_device=False, kind="sample",
+                        uri="query:LivePacks#www.ableton.com/249:Samples:Acoustic%20Kick%20Loop%2086bpm.aif",
+                        source="Chop and Swing")])])]),   # as Live 12.4.7 has them: no FileId
+        user_library=BrowserItem("User Library", [BrowserItem("Presets")]),
+        user_folders=[BrowserItem("My Samples", [
+            BrowserItem("Field Rec.wav", loadable=True, is_device=False, kind="sample", uri="")])],
         load_item=loaded.append,
+        preview_item=lambda item: world.previews.append(item.name),
+        stop_preview=lambda: world.previews.append(None),
     )
-    app = Obj(browser=browser, get_major_version=lambda: 12, get_minor_version=lambda: 4,
+    app = Obj(browser=browser, view=AppView(), get_major_version=lambda: 12, get_minor_version=lambda: 4,
               get_bugfix_version=lambda: 6)
     cmds = bridge_commands.Commands(lambda: song, lambda: app)
     world = Obj(song=song, app=app, cmds=cmds, src=src, rec=rec, plugin=plugin, loaded=loaded,
-                test_chords=test_chords, port_type=port_type, pending=[])
+                test_chords=test_chords, port_type=port_type, pending=[], previews=[])
 
     def apply_loads():
         """Like Live: a load lands a few ticks later on the selected track, and an instrument
         replaces the track's instrument instead of adding one."""
         while loaded:
-            world.pending.append([3, loaded.pop(0), song.view.selected_track])
+            world.pending.append([3, loaded.pop(0), song.view.selected_track, song.view.highlighted_clip_slot])
         for job in list(world.pending):
             job[0] -= 1
             if job[0] > 0:
                 continue
             world.pending.remove(job)
-            _, item, track = job
+            _, item, track, slot = job
             kind = item.kind or "instrument"
-            dev = device(item.name.rsplit(".", 1)[0], kind)
+            if kind == "sample":
+                if "bpm" in item.name:
+                    song.tempo = 86.0               # as Live did with this loop in an empty set
+                if not track.has_midi_input:    # an audio track: a clip in the highlighted slot,
+                    if not app.view.is_view_visible("Session"):   # only in Session view
+                        continue
+                    slot.clip = Obj(name=item.name.rsplit(".", 1)[0], is_audio_clip=True,
+                                    file_path="/samples/" + item.name, length=4.0)
+                    continue
+                item_name, kind = "Simpler", "instrument"
+            else:
+                item_name = item.name.rsplit(".", 1)[0]
+            dev = device(item_name, kind)
             old = [i for i, d in enumerate(track.devices) if d.type == 1]
             if kind == "instrument" and old:
                 track.devices[old[0]] = dev
@@ -165,6 +223,18 @@ def make_world():
 
     world.apply_loads = apply_loads
     return world
+
+
+@pytest.fixture(autouse=True)
+def fresh_index(tmp_path, monkeypatch):
+    """The Remote Script's INDEX is module-level (it outlives the control surface), and so are the
+    MCP server's index and its cache: give every test its own."""
+    from ableton_mcp import index as mcp_index, server as mcp_server
+    bridge_indexer.INDEX.reset()
+    monkeypatch.setattr(mcp_index, "CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(mcp_server, "_index", None)
+    yield
+    bridge_indexer.INDEX.reset()
 
 
 # -- protocol ----------------------------------------------------------------
@@ -179,6 +249,7 @@ def served():
     def tick():
         while not stop.is_set():
             srv.poll()
+            world.cmds.tick()
             world.apply_loads()
             time.sleep(0.01)
 
@@ -545,3 +616,219 @@ def test_list_and_update_tracks(served, monkeypatch):
     assert listed["master"]["kind"] == "master"
     deleted = server.delete_track("return:0")
     assert deleted["name"] == "Verb" and deleted["return_track_count"] == 0
+
+
+# -- Phase 2: the browser index, search and load ------------------------------------
+
+def _build(w, budget_ms=0):
+    w.cmds.dispatch("index_start", {})
+    bridge_indexer.INDEX.budget_ms = budget_ms   # 0: one node per tick
+    ticks = 0
+    while bridge_indexer.INDEX.state == "running":
+        w.cmds.tick()
+        ticks += 1
+    return ticks
+
+
+def test_indexer_walks_a_little_per_tick():
+    w = make_world()
+    status = w.cmds.dispatch("index_start", {"budget_ms": 15})
+    assert status["state"] == "running" and status["budget_ms"] == 15
+    ticks = _build(w)
+    status = w.cmds.dispatch("index_status", {})
+    assert status["state"] == "done" and ticks > 10          # one node per tick: many ticks
+    page = w.cmds.dispatch("index_page", {"offset": 0, "limit": 100})
+    by_name = {e["name"]: e for e in page["entries"]}
+    assert by_name["Drift"]["root"] == "instruments" and by_name["Drift"]["is_device"] is True
+    assert by_name["Attack Pad.adv"]["path"] == ["Pads", "Attack Pad.adv"]
+    assert by_name["Field Rec.wav"]["root"] == "user_folders"
+    assert by_name["Field Rec.wav"]["id"] == "user_folders:My Samples/Field Rec.wav"   # no URI
+    assert [e["root"] for e in page["entries"]].count("packs") == 1
+    assert not any(e["name"] in ("Pads", "Presets") for e in page["entries"])   # folders aren't entries
+    assert w.cmds.dispatch("index_page", {"offset": 2, "limit": 1})["entries"] == page["entries"][2:3]
+    with pytest.raises(bridge_commands.CommandError, match="unknown browser roots"):
+        w.cmds.dispatch("index_start", {"roots": ["nope"]})
+
+
+def test_index_outlives_the_control_surface():
+    """Live re-creates the control surface (and Commands) on every set load; INDEX is module-level."""
+    w = make_world()
+    _build(w)
+    fresh = bridge_commands.Commands(lambda: w.song, lambda: w.app)
+    assert fresh.cmd_index_status()["state"] == "done"
+    fresh.cmd_load_item("query:Samples#FileId_7001", 1)
+    assert w.loaded[-1].name == "Snare One Shot.wav"
+
+
+def test_load_item_finds_an_item_by_path_without_the_index():
+    w = make_world()   # nothing indexed: an index read from the disk cache after Live restarted
+    res = w.cmds.dispatch("load_item", {"id": "query:Samples#FileId_6889", "track": 1, "root": "samples",
+                                        "path": ["Acoustic Kick Loop 86bpm.aif"], "scene": 2})
+    assert res["name"] == "Acoustic Kick Loop 86bpm.aif" and res["tempo_before"] == 120.0
+    assert w.song.view.highlighted_clip_slot is w.rec.clip_slots[2]
+    assert res["showed_session_view"] is True and w.app.view.shown == ["Session"]
+    assert w.cmds.dispatch("view_state", {})["Session"] is True
+    w.cmds.dispatch("load_item", {"id": "user_folders:My Samples/Field Rec.wav", "track": 1,
+                                  "root": "user_folders", "path": ["My Samples", "Field Rec.wav"]})
+    assert w.loaded[-1].name == "Field Rec.wav"
+    with pytest.raises(bridge_commands.CommandError, match="no longer"):
+        w.cmds.dispatch("load_item", {"id": "query:Samples#FileId_1", "track": 1, "root": "samples",
+                                      "path": ["Acoustic Kick Loop 86bpm.aif"]})   # another item there now
+    with pytest.raises(bridge_commands.CommandError, match="give its root and path"):
+        w.cmds.dispatch("load_item", {"id": "query:Samples#FileId_1", "track": 1})
+    w.cmds.dispatch("preview_item", {"id": "query:Samples#FileId_7001", "root": "samples",
+                                     "path": ["Snare One Shot.wav"]})
+    w.cmds.dispatch("stop_preview", {})
+    assert w.previews == ["Snare One Shot.wav", None]
+
+
+def _index_of(w):
+    from ableton_mcp.index import Index
+    _build(w)
+    return Index(w.cmds.dispatch("index_page", {"limit": 10000})["entries"], {"live_version": "test"})
+
+
+def test_index_merges_packs_and_works_out_kinds():
+    w = make_world()
+    idx = _index_of(w)
+    kick = idx.get("query:Samples#FileId_6889")
+    assert kick["root"] == "samples" and kick["kind"] == "sample" and kick["pack"] == "Chop and Swing"
+    packs_id = "query:LivePacks#www.ableton.com/249:Samples:Acoustic%20Kick%20Loop%2086bpm.aif"
+    assert idx.get(packs_id) is kick                                     # the Packs copy is an alias
+    assert idx.raw_count == len(idx.entries) + 1
+    assert kick["hints"] == {"bpm": 86, "loop": True}
+    assert idx.get("query:Samples#FileId_7001")["hints"] == {"loop": False}
+    kinds = {e["stem"]: e["kind"] for e in idx.entries}
+    assert kinds["Drift"] == "instrument" and kinds["Attack Pad"] == "sound" and kinds["Reverb"] == "audio_effect"
+    assert kinds["TestSynth"] == "plugin" and kinds["Field Rec"] == "sample"
+
+
+def test_packs_copies_merge_by_pack_folder_and_name():
+    from ableton_mcp.index import Index
+    sample = lambda id, name, root, path, source: {"id": id, "name": name, "root": root, "path": path,
+                                                   "is_device": False, "source": source}
+    raw = [
+        sample("query:Drums#Drum%20Hits:Kick:FileId_1", "Kick LD.aif", "drums", ["Drum Hits", "Kick", "Kick LD.aif"], "Core Library"),
+        sample("query:Drums#Drum%20Hits:Kick:FileId_2", "Kick LD.aif", "drums", ["Drum Hits", "Kick", "Kick LD.aif"], "Drum Essentials"),
+        sample("query:Samples#FileId_3", "Snap.wav", "samples", ["Snap.wav"], "Drum Essentials"),
+        sample("query:Samples#FileId_4", "Snap.wav", "samples", ["Snap.wav"], "Drum Essentials"),
+        sample("query:LivePacks#core:Kick%20LD.aif", "Kick LD.aif", "packs", ["Core Library", "Samples", "Kick", "Kick LD.aif"], "Core Library"),
+        sample("query:LivePacks#de:Kick%20LD.aif", "Kick LD.aif", "packs", ["Drum Essentials", "Samples", "Kick", "Kick LD.aif"], "Drum Essentials"),
+        sample("query:LivePacks#de:Snap.wav", "Snap.wav", "packs", ["Drum Essentials", "Samples", "Snap.wav"], "Drum Essentials"),
+        sample("query:LivePacks#de:Only.wav", "Only.wav", "packs", ["Drum Essentials", "Samples", "Only.wav"], "Drum Essentials"),
+    ]
+    idx = Index(raw)
+    assert idx.get("query:LivePacks#core:Kick%20LD.aif")["id"] == "query:Drums#Drum%20Hits:Kick:FileId_1"
+    assert idx.get("query:LivePacks#de:Kick%20LD.aif")["id"] == "query:Drums#Drum%20Hits:Kick:FileId_2"
+    kicks = idx.search("kick ld")
+    assert [(r["name"], r["pack"]) for r in kicks] == [("Kick LD", "Core Library"), ("Kick LD", "Drum Essentials")]
+    assert idx.get("query:LivePacks#de:Snap.wav")["root"] == "packs"     # two files it could be: kept apart
+    assert idx.get("query:LivePacks#de:Only.wav")["pack"] == "Drum Essentials"   # only in Packs
+    assert len(idx.entries) == 6 and "Samples" in idx.get("query:Drums#Drum%20Hits:Kick:FileId_2")["context"]
+
+
+def test_whole_words_rank_above_word_starts():
+    from ableton_mcp.index import Index
+    raw = [{"id": n, "name": n + ".adg", "root": "sounds", "path": ["Pads", n + ".adg"], "is_device": False,
+            "source": "Core Library"} for n in ("Paddles Out", "Sea Pad", "PPP Pad")]
+    assert [r["name"] for r in Index(raw).search("pad")] == ["PPP Pad", "Sea Pad", "Paddles Out"]
+
+
+def test_an_item_listed_under_two_roots_is_both_kinds():
+    """Live lists a preset under Instruments > Drift and under Sounds > a category: keep both."""
+    from ableton_mcp.index import Index
+    raw = [{"id": "query:Instruments#FileId_5", "name": "Glass Pad.adv", "root": "instruments",
+            "path": ["Drift", "Glass Pad.adv"], "is_device": False, "source": "Core Library"},
+           {"id": "query:Sounds#FileId_5", "name": "Glass Pad.adv", "root": "sounds",
+            "path": ["Ambient & Evolving", "Glass Pad.adv"], "is_device": False, "source": "Core Library"}]
+    idx = Index(raw)
+    assert len(idx.entries) == 1 and idx.entries[0]["kinds"] == ["instrument", "sound"]
+    assert [r["name"] for r in idx.search("pad", kind="sound")] == ["Glass Pad"]
+    hit = idx.search("ambient")[0]                      # a folder from the Sounds listing
+    assert hit["name"] == "Glass Pad" and hit["kind"] == "instrument" and hit["also"] == ["sound"]
+    assert idx.stats()["kinds"] == {"instrument": 1, "sound": 1}
+
+
+def test_search_ranking_filters_and_typos():
+    from ableton_mcp.index import Index
+    raw = [
+        {"id": "d", "name": "Drift", "root": "instruments", "path": ["Drift"], "is_device": True, "source": "Core Library"},
+        {"id": "dp", "name": "Drift Pad.adv", "root": "instruments", "path": ["Drift", "Drift Pad.adv"], "is_device": False, "source": "Core Library"},
+        {"id": "wp", "name": "Warm Analog Pad.adg", "root": "sounds", "path": ["Ambient & Evolving", "Warm Analog Pad.adg"], "is_device": False, "source": "Core Library"},
+        {"id": "ev", "name": "Glass Swell.adg", "root": "sounds", "path": ["Ambient & Evolving", "Glass Swell.adg"], "is_device": False, "source": "Core Library"},
+        {"id": "query:Samples#FileId_1", "name": "Kick 808 Long.wav", "root": "samples", "path": ["Kick 808 Long.wav"], "is_device": False, "source": "Drum Essentials"},
+        {"id": "query:Samples#FileId_2", "name": "Big Kick.aif", "root": "drums", "path": ["Kicks", "Big Kick.aif"], "is_device": False, "source": "Core Library"},
+        {"id": "rv", "name": "Reverb", "root": "audio_effects", "path": ["Reverb"], "is_device": True, "source": "Core Library"},
+        {"id": "rvp", "name": "Big Room Reverb.adv", "root": "audio_effects", "path": ["Reverb", "Big Room Reverb.adv"], "is_device": False, "source": "Core Library"},
+    ]
+    idx = Index(raw)
+    names = lambda res: [r["name"] for r in res]
+    assert names(idx.search("drift"))[:2] == ["Drift", "Drift Pad"]           # the device first
+    assert names(idx.search("warm pad", kind="instrument")) == ["Warm Analog Pad"]
+    assert "Glass Swell" in names(idx.search("evolving"))                      # its folder matches
+    assert names(idx.search("kick", kind="sample")) == ["Big Kick", "Kick 808 Long"]   # tie: shorter first
+    assert names(idx.search("kick", kind="instrument")) == []
+    assert names(idx.search("kick", pack="drum ess")) == ["Kick 808 Long"]
+    assert names(idx.search("verb"))[0] == "Reverb"                            # synonym
+    assert names(idx.search("reverb", kind="audio_effect"))[:2] == ["Reverb", "Big Room Reverb"]
+    assert names(idx.search("drfit")) == ["Drift"]                             # typo
+    assert idx.search("kick", kind="sample", limit=1)[0]["id"] == "query:Samples#FileId_2"
+    with pytest.raises(ValueError, match="kind"):
+        idx.search("x", kind="nope")
+
+
+def test_index_cache_round_trip_and_fingerprint(tmp_path):
+    w = make_world()
+    idx = _index_of(w)
+    path = str(tmp_path / "idx.json")
+    idx.save(path)
+    from ableton_mcp.index import Index
+    again = Index.load(path, {"live_version": "test"})
+    assert [e["id"] for e in again.entries] == [e["id"] for e in idx.entries]
+    assert again.get("query:LivePacks#www.ableton.com/249:Samples:Acoustic%20Kick%20Loop%2086bpm.aif")["root"] == "samples"
+    assert Index.load(path, {"live_version": "other"}) is None
+    assert Index.load(str(tmp_path / "missing.json"), {"live_version": "test"}) is None
+
+
+def test_mcp_search_and_load_item(served, monkeypatch):
+    from ableton_mcp import server
+    client, w = served
+    monkeypatch.setattr(server, "_client", client)
+    res = server.search("kick", kind="sample")
+    assert res["results"][0]["name"] == "Acoustic Kick Loop 86bpm" and res["index"]["from_cache"] is False
+    kick = res["results"][0]["id"]
+
+    # a sample on an audio track: a clip in the first empty slot, and the tempo put back
+    audio = server.add_track(kind="audio", name="Loops")
+    w.song.tracks[audio["index"]].clip_slots[0].clip = Obj(name="old", is_audio_clip=True, file_path=None, length=1.0)
+    out = server.load_item(kick, "Loops")
+    assert out["scene"] == 1 and out["clip"]["name"] == "Acoustic Kick Loop 86bpm"
+    assert out["showed_session_view"] is True     # it was in Arrangement view, where the load does nothing
+    assert out["tempo_changed"] == {"from": 120.0, "to": 86.0, "restored": True} and w.song.tempo == 120.0
+    with pytest.raises(server.ToolError, match="already has a clip"):
+        server.load_item(kick, "Loops", scene=0)
+
+    # the same sample on a MIDI track: a Simpler; keep_tempo=False leaves Live's tempo
+    out = server.load_item(kick, "Synth Rec", keep_tempo=False)
+    assert out["device"]["name"] == "Simpler" and w.song.tempo == 86.0
+
+    # an instrument needs a MIDI track; add_track takes a search result id
+    drift = server.search("drift", kind="instrument")["results"][0]["id"]
+    with pytest.raises(server.ToolError, match="needs a MIDI track"):
+        server.load_item(drift, "Loops")
+    lead = server.add_track(name="Lead", instrument=drift)
+    assert lead["instrument"]["name"] == "Drift"
+    with pytest.raises(server.ToolError, match="no browser item"):
+        server.load_item("query:Nope", 0)
+
+    server.preview_item(kick)
+    server.stop_preview()
+    assert w.previews == ["Acoustic Kick Loop 86bpm.aif", None]
+
+    # a second MCP process reads the disk cache instead of indexing again
+    monkeypatch.setattr(server, "_index", None)
+    bridge_indexer.INDEX.reset()
+    assert server.search("drift")["index"]["from_cache"] is True
+    assert bridge_indexer.INDEX.state == "idle"
+    assert server.load_item(kick, "Loops")["scene"] == 2       # found again by its path
+    assert server.refresh_index()["entries"] == len(server._index.entries)

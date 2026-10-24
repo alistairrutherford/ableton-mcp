@@ -93,19 +93,25 @@ class LiveClient:
             time.sleep(interval)
 
     def load_device_and_wait(self, name, track, category="plugins", format=None, timeout=20.0):
-        """Load from the browser and wait until the track's devices change; returns the new device's
-        info, with `replaced` set to the device it took the place of, if any.
+        """Load from the browser by name and wait until the track's devices change; returns the new
+        device's info, with `replaced` set to the device it took the place of, if any."""
+        res = self.call("load_device", name=name, track=track, category=category, format=format)
+        info = self.wait_for_new_device(track, res["devices_before"], timeout, what="%s to load" % name)
+        info["browser_item"] = res["loaded"]
+        return info
+
+    def wait_for_new_device(self, track, before, timeout, what="a device"):
+        """Wait until a track's devices differ from `before` (list_devices output); return the new
+        device with `replaced` set to the one it took the place of, if any.
 
         An effect is added to the chain, but an instrument replaces the track's instrument, so the
         device count can stay the same: we wait for the list to differ, not to grow.
         """
-        res = self.call("load_device", name=name, track=track, category=category, format=format)
-        before = res["devices_before"]
         old = [_device_key(d) for d in before]
         devices = self.wait_until(
             lambda: (lambda d: d if [_device_key(x) for x in d] != old else None)(
                 self.call("list_devices", track=track)),
-            timeout, what="%s to load on track %s" % (name, track))
+            timeout, what="%s on track %s" % (what, track))
         now = [_device_key(d) for d in devices]
         new = [d for d, k in zip(devices, now) if k not in old]
         if not new:  # the same devices, reordered: take the first one that moved
@@ -113,8 +119,36 @@ class LiveClient:
         gone = [d for d, k in zip(before, old) if k not in now]
         info = dict(new[0])
         info["replaced"] = gone[0] if gone else None
-        info["browser_item"] = res["loaded"]
         return info
+
+    def load_item_and_wait(self, id, track, root=None, path=None, scene=None, expect="device",
+                           timeout=20.0):
+        """Load a browser index entry (see the index_* commands) and wait for the result.
+
+        expect="device": the track's devices change (see wait_for_new_device).
+        expect="clip": clip slot `scene` gets a clip (a sample on an audio track, a clip file).
+        Returns {"device": ...} or {"clip": ...}, plus "tempo_before" and "tempo_after", since
+        loading a loop can change the song tempo.
+        """
+        if expect not in ("device", "clip"):
+            raise ValueError("expect must be 'device' or 'clip'")
+        if expect == "clip" and scene is None:
+            raise ValueError("a clip needs a scene (clip slot) to go into")
+        res = self.call("load_item", id=id, track=track, root=root, path=path, scene=scene)
+        out = {"track": res["track"], "id": id, "name": res["name"], "tempo_before": res["tempo_before"]}
+        if res.get("showed_session_view"):
+            out["showed_session_view"] = True
+        what = "%s to load" % res["name"]
+        if expect == "device":
+            out["device"] = self.wait_for_new_device(track, res["devices_before"], timeout, what)
+        else:
+            out["clip"] = self.wait_until(
+                lambda: (lambda sl: sl["clip"] if sl["has_clip"] else None)(
+                    self.call("clip_slots", track=track)[scene]),
+                timeout, what="%s into slot %d of track %s" % (what, scene, track))
+            out["scene"] = scene
+        out["tempo_after"] = self.call("get_state", include_devices=False)["tempo"]
+        return out
 
     def wait_song_time(self, beats, timeout):
         return self.wait_until(

@@ -20,6 +20,8 @@ from mcp.types import ToolAnnotations
 from livebridge import livelog
 from livebridge.client import BRIDGE_NAME, BridgeError, LiveClient
 
+from .index import NEEDS_MIDI, Index
+
 Key = Union[int, str]
 
 REMOTE_SCRIPTS = os.path.join(os.environ.get("LIVE_USER_LIBRARY", os.path.expanduser("~/Music/Ableton/User Library")),
@@ -30,6 +32,7 @@ INSTRUMENT_CATEGORIES = ("instruments", "sounds", "drums", "plugins")
 
 mcp = MCPServer("ableton")
 _client = LiveClient(timeout=15.0)
+_index = None   # the browser Index, built or read from the cache on the first search
 
 
 def _hints(**hints):
@@ -132,7 +135,13 @@ def _load_and_wait(name, track, category, format=None):
 
 
 def _load_instrument(instrument, track, category):
-    """Load `instrument` from `category`, or from the first of INSTRUMENT_CATEGORIES that has it."""
+    """Load `instrument`: a search result id, or a name looked up in `category` or else in the
+    first of INSTRUMENT_CATEGORIES that has it."""
+    if instrument.startswith("query:") or (_index is not None and _index.get(instrument)):
+        entry = _entry(instrument)
+        if entry["kind"] not in ("instrument", "sound", "drum", "plugin", "sample", "preset"):
+            raise ToolError("%r is a %s, not an instrument" % (entry["stem"], entry["kind"]))
+        return _load_entry(entry, track, None, "device")["device"]
     if category:
         return _load_and_wait(instrument, track, category)
     misses = []
@@ -237,14 +246,129 @@ def delete_track(track: Key) -> dict:
     return _call("delete_track", track=track)
 
 
+# -- search and load (Phase 2) ---------------------------------------------------
+
+def _get_index(rebuild=False):
+    """The browser index: this process's copy, else the disk cache if Live's browser still matches
+    it, else built by the Remote Script (about 10 s) and cached."""
+    global _index
+    if _index is not None and not rebuild:
+        return _index
+    fingerprint = _call("index_fingerprint")
+    path = Index.cache_path(fingerprint["live_version"])
+    cached = None if rebuild else Index.load(path, fingerprint)
+    if cached is not None:
+        cached.from_cache = True
+        _index = cached
+        return _index
+    try:
+        built = Index.build(_client, fingerprint)
+    except (BridgeError, TimeoutError) as e:
+        raise ToolError("could not index Live's browser: %s" % e)
+    except OSError as e:
+        _client.close()
+        raise ToolError("bridge not reachable: %s" % e)
+    built.from_cache = False
+    built.save(path)
+    _index = built
+    return _index
+
+
+def _entry(id):
+    entry = _get_index().get(id)
+    if entry is None:
+        raise ToolError("no browser item with id %r; search again (or refresh_index if content changed)" % (id,))
+    return entry
+
+
+def _load_entry(entry, track, scene, expect):
+    try:
+        return _client.load_item_and_wait(entry["id"], track, entry["root"], entry["path"], scene, expect)
+    except (BridgeError, TimeoutError, ValueError) as e:
+        raise ToolError(str(e))
+    except OSError as e:
+        _client.close()
+        raise ToolError("bridge not reachable: %s" % e)
+
+
+@mcp.tool(annotations=READ_ONLY)
+def search(query: str, kind: str = "any", limit: int = 20, pack: Optional[str] = None) -> dict:
+    """Search Live's browser for instruments, presets, samples, clips and effects.
+
+    kind: any, instrument (instruments and their presets, and Sounds), sound, drum, sample, clip,
+    audio_effect, midi_effect, effect, plugin, max_for_live or preset. pack: only items from a
+    pack whose name contains this. Results are ranked (exact name, then prefix, then all words in
+    the name, then words in its folders or pack; typos are tried when nothing matches) and carry
+    an `id` for load_item and preview_item. Samples have `hints` from their filename (bpm, key,
+    loop). Live's browser has no tags: words like "warm" or "pad" match names and folders such as
+    Sounds' "Ambient & Evolving". The first search indexes the browser (about 10 s), then it is
+    cached on disk.
+    """
+    index = _get_index()
+    try:
+        results = index.search(query, kind=kind, limit=limit, pack=pack)
+    except ValueError as e:
+        raise ToolError(str(e))
+    return {"results": results, "count": len(results),
+            "index": {"entries": len(index.entries), "from_cache": getattr(index, "from_cache", None)}}
+
+
 @mcp.tool()
-def browser_search(query: str, category: str = "plugins", format: Optional[str] = None,
-                   limit: int = 50) -> list:
-    """Search a browser tree (plugins, instruments, audio_effects, midi_effects, drums, sounds,
-    max_for_live, user_library, packs, samples, clips, current_project) for loadable items whose
-    name contains `query`.
-    For plugins, `format` filters by vst3, au or vst."""
-    return _call("browser_search", query=query, category=category, format=format, limit=limit)
+def load_item(id: str, track: Key, scene: Optional[int] = None, keep_tempo: bool = True) -> dict:
+    """Load a search result onto a track, as double-clicking it in Live's browser would.
+
+    Instruments, presets and Sounds go on MIDI tracks (an instrument replaces the track's
+    instrument). Effects go on any track. A sample goes into a new Simpler on a MIDI track, or into
+    clip slot `scene` (default: the first empty one) on an audio track; a clip file goes into a
+    slot too. Loading a loop can change the song tempo: with keep_tempo, the tempo is put back.
+    """
+    entry = _entry(id)
+    t = _call("get_track", track=track)
+    kind, track_kind = entry["kind"], t["kind"]
+    if NEEDS_MIDI.intersection(entry["kinds"]) and track_kind != "midi":
+        raise ToolError("%s %r needs a MIDI track; %r is a %s track" % (kind, entry["stem"], t["name"], track_kind))
+    if kind in ("sample", "clip") and track_kind not in ("midi", "audio"):
+        raise ToolError("a %s goes on a MIDI or audio track; %r is a %s track" % (kind, t["name"], track_kind))
+    expect = "clip" if kind == "clip" or (kind == "sample" and track_kind == "audio") else "device"
+    if expect == "clip":
+        slots = _call("clip_slots", track=t["index"])
+        if scene is None:
+            empty = [sl["scene"] for sl in slots if not sl["has_clip"]]
+            if not empty:
+                raise ToolError("track %r has no empty clip slot; add a scene or give `scene`" % t["name"])
+            scene = empty[0]
+        elif not 0 <= scene < len(slots):
+            raise ToolError("scene %d out of range (0..%d)" % (scene, len(slots) - 1))
+        elif slots[scene]["has_clip"]:
+            raise ToolError("slot %d on %r already has a clip" % (scene, t["name"]))
+    res = _load_entry(entry, t["index"], scene if expect == "clip" else None, expect)
+    if res["tempo_after"] != res["tempo_before"]:
+        res["tempo_changed"] = {"from": res["tempo_before"], "to": res["tempo_after"], "restored": keep_tempo}
+        if keep_tempo:
+            _call("set_tempo", bpm=res["tempo_before"])
+    res["item"] = Index.public(entry)
+    return res
+
+
+@mcp.tool()
+def preview_item(id: str) -> dict:
+    """Play a search result through Live's browser preview (samples; some presets), to audition it.
+    stop_preview stops it."""
+    entry = _entry(id)
+    return _call("preview_item", id=entry["id"], root=entry["root"], path=entry["path"])
+
+
+@mcp.tool()
+def stop_preview() -> dict:
+    """Stop the browser preview."""
+    return _call("stop_preview")
+
+
+@mcp.tool()
+def refresh_index() -> dict:
+    """Re-index Live's browser (about 10 s): after installing a pack or adding files to the User
+    Library or a browser folder, if search doesn't find them."""
+    return _get_index(rebuild=True).stats()
 
 
 @mcp.tool()

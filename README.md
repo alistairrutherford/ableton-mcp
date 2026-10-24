@@ -52,6 +52,7 @@ bigger plug-ins, add `-_PluginAutoPopulateThreshold=128` to
 ```sh
 uv run pytest tests/test_offline.py     # no Live needed
 uv run pytest tests/test_tracks_live.py # Phase 1 in Live: tracks, colours, instruments
+uv run pytest tests/test_search_live.py # Phase 2 in Live: index, search, load samples and devices
 ```
 
 Live tests take the `live` fixture from `conftest.py`, which skips them when the bridge doesn't
@@ -74,7 +75,15 @@ Its tools are most of the commands below, plus:
   instrument. The instrument is looked up in instruments, sounds, drums, then plugins. If it
   can't be loaded, the track is removed again.
 - `update_track`: name, colour, mute, solo, arm, monitoring.
-- `load_device`: waits for the device and says what it replaced.
+- `search`: Live's browser, ranked, with a `kind` filter (instrument, sound, drum, sample, clip,
+  audio_effect, midi_effect, effect, plugin, preset) and an optional `pack`. Results carry an `id`;
+  samples carry `hints` from the filename (bpm, key, loop). See "Browser index" below.
+- `load_item`: a search result onto a track. Instruments and presets go on MIDI tracks; a sample
+  goes into a Simpler on a MIDI track, or into the first empty clip slot on an audio track; a
+  loop's tempo change is undone unless `keep_tempo=false`.
+- `preview_item` / `stop_preview`: audition a search result through Live's browser preview.
+- `refresh_index`: re-index after installing a pack or adding files.
+- `load_device`: load by name instead of by id; waits for the device and says what it replaced.
 - `get_audio_settings`: sample rate, buffer sizes and latencies from Live's log.
 - `bridge_command`: any command by name. This includes the ones `add_track` and `update_track`
   stand in for (`create_*_track`, `set_track`, `arm_track`) and the Phase 0 probes.
@@ -140,7 +149,16 @@ to the nearest palette colour (`#ff0000` → `#ff3636`, index 14). Tracks report
 | `get_track` | `track` | the track |
 | `set_track` | `track`, `name? color? arm? monitoring? ("in"/"auto"/"off") mute? solo?` | the track |
 | `arm_track` | `track`, `arm=true` | `{track, arm}` |
-| `browser_search` | `query`, `category="plugins"`, `format?`, `limit=50` | `[{name, path, uri, format, exact, is_device}]` |
+| `browser_search` | `query`, `category="plugins"`, `format?`, `limit=50` | `[{name, path, uri, format, exact, is_device}]`. Walks the tree in one tick: prefer the index (`search`). |
+| `index_start` | `roots?` (default all but `current_project`), `budget_ms?` (per tick, default 30) | the index status. The walk then runs a little per tick. |
+| `index_status` | | `{state (idle/running/done), entries, open_folders, ticks, walk_ms, slowest_tick_ms, wall_s, budget_ms}` |
+| `index_page` | `offset=0`, `limit=2000` | `{total, offset, entries: [{id, name, root, path, is_device, source}]}` |
+| `index_fingerprint` | | `{live_version, packs, user_library, user_folders}`: what a cached index depends on |
+| `load_item` | `id`, `track`, `root?`, `path?`, `scene?` | `{track, id, name, devices_before, scene, slot_had_clip, showed_session_view, tempo_before}`. `root` and `path` find the item again when the index in Live doesn't hold it (after a restart). With `scene`, Session view is brought to the front first: in Arrangement view Live ignores the load. |
+| `view_state` | | which of Session, Arranger, Browser, Detail, Detail/Clip, Detail/DeviceChain are showing |
+| `preview_item` | `id`, `root?`, `path?` | `{previewing, name}` |
+| `stop_preview` | | `{stopped}` |
+| `clip_slots` | `track` | `[{scene, has_clip, clip: {name, is_audio_clip, file_path, length}}]` |
 | `load_device` | `name`, `track`, `category="plugins"`, `format?`, `scene?` (the clip slot to highlight first, where a sample goes on an audio track) | `{track, device_count_before, devices_before, loaded, other_matches}`. The device appears a moment later. An instrument replaces the track's instrument, so `load_device_and_wait` waits for the list to differ from `devices_before`. |
 | `load_plugin` | `name`, `track`, `format?` | same as `load_device` with category `plugins` |
 | `list_devices` | `track` | `[{index, name, class_name, class_display_name, type, is_active, parameter_count}]` |
@@ -161,6 +179,25 @@ to the nearest palette colour (`#ff0000` → `#ff3636`, index 14). Tracks report
 | `load_clip_file` | `name`, `category="user_library"` | loads a MIDI file from the browser as a double-click would: Live imports it as a session clip on a new MIDI track; returns `track_count_before` and the browser item |
 | `get_cpu` | | `{average, peak}`: Live's CPU meter (`Application.average_process_usage` / `peak_process_usage`, in percent: about 0.6 for an empty set in 12.4.6), `null` where Live lacks them |
 | `delete_device` | `track`, `device` | `{track, deleted, devices}` |
+
+**Browser index.** `indexer.py` walks every browser root a few ms per Live tick (an iterator per
+open folder, so even the flat Samples root never lists all its children in one tick). It keeps the
+`id → BrowserItem` map at module level, because Live re-creates the control surface on every set
+load. An item's id is its URI, or `<root>:<path>` where it has none. The MCP server reads the
+entries once and caches them in `~/Library/Caches/ableton-mcp/browser-index-<live version>.json`
+(override with `ABLETON_MCP_CACHE`), rebuilding when `index_fingerprint` changes. Live lists one
+file in several places, and the server merges them:
+
+- A preset under Instruments and under a Sounds category has the same `FileId` in both URIs.
+- The Packs tree repeats almost everything under URIs with no `FileId`. A Packs entry joins the
+  item from the same pack (its `source`) with the same parent folder and filename, or the same
+  filename where that's unique.
+
+In Live 12.4.7 Standard that turns 24,150 entries into 9,551 items, of which 550 exist only in
+Packs (mostly legacy devices). An item is every kind it is listed as (`kind`, plus `also`). All
+its folders count for ranking. Its kind comes from its root and file type. Browser items have no tags, so ranking uses, in order: the exact name, a prefix, all
+words in the name, then words in its folders or pack. A few synonyms are built in ("verb",
+"bd", "hh", "keys", ...), and close misspellings are tried when nothing matches.
 
 **Plug-in lookup.** `load_device` walks `application().browser.<category>` (for plugins, the
 Plug-Ins tree). It loads onto the track by selecting it and calling `browser.load_item`.

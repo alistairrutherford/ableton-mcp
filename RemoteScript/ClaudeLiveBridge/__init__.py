@@ -38,6 +38,7 @@ class ClaudeLiveBridge(ControlSurface):
         if self._server is not None:
             try:
                 self._server.poll()
+                self._commands.tick()
             except Exception as e:  # never let the bridge break Live's tick
                 self._log("poll error: %r" % e)
 
