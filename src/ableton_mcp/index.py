@@ -173,13 +173,17 @@ class Index:
 
     @classmethod
     def build(cls, client, fingerprint, roots=None, budget_ms=None, timeout=180.0, progress=None):
-        """Have the Remote Script walk the browser, wait for it, and read the entries in pages."""
-        status = client.call("index_start", roots=roots, budget_ms=budget_ms)
+        """Have the Remote Script walk the browser, wait for it, and read the entries in pages. If a
+        walk is already running (another MCP server started it), wait for that one instead of
+        starting over."""
+        status = client.call("index_status")
+        if status["state"] != "running":
+            status = client.call("index_start", roots=roots, budget_ms=budget_ms)
         deadline = time.monotonic() + timeout
         while status["state"] != "done":
             if time.monotonic() > deadline:
-                raise TimeoutError("browser index still building after %.0f s (%d entries so far)" % (
-                    timeout, status["entries"]))
+                raise TimeoutError("Live's browser index is still building after %.0f s (%d entries so far); "
+                                   "search again in a moment and it carries on" % (timeout, status["entries"]))
             time.sleep(0.5)
             status = client.call("index_status")
             if progress:

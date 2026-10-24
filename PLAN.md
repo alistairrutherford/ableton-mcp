@@ -4,20 +4,29 @@ A Claude plugin (an MCP server, plus a skill) that lets Claude work in Ableton L
 projects, add tracks, and find and load instruments and samples. It is built on **LiveBridge**,
 the component already used by Chordism and NoteCap.
 
-Status (2026-10-24): Phases 0 to 4 are done, so all three goals are met and packaged as a plugin. ClaudeLiveBridge runs on port
-9873; the spikes are in `docs/spikes.md`.
+Status (2026-10-24): all phases (0 to 5) are done. All three goals are met, packaged as a
+plugin, and hardened. ClaudeLiveBridge runs on port 9873; the spikes are in `docs/spikes.md`.
 
 - Tracks: return tracks, colour, and `add_track` with an instrument.
 - Search and load: a time-sliced index (9,551 items, about 9 s to build, then cached), ranked
   `search`, and `load_item` / `preview_item`.
 - Projects: `create_project`, `open_project`, `list_projects` and `get_project_info`.
-- Packaging: a Claude Code plugin (`.claude-plugin/plugin.json`, a one-plugin marketplace,
-  the `ableton-live` skill) and `install_remote_script` / `python -m ableton_mcp install-remote-script`.
+- Packaging: a Claude Code plugin (`.claude-plugin/plugin.json`, a one-plugin marketplace, the
+  `ableton-live` skill), and `install_remote_script` / `python -m ableton_mcp install-remote-script`.
+- Hardening:
+  - reconnects across set loads and Live restarts (reads are retried, writes never);
+  - errors that say whether Live is down, the bridge isn't selected, or Live is busy;
+  - tick-budget tests on a fake clock;
+  - a rotating log in `~/Library/Logs/ableton-mcp/`.
 
-They pass 43 offline tests, and `tests/test_tracks_live.py`, `tests/test_search_live.py` and
-`tests/test_projects_live.py` in Live 12.4.7. `save_project` (Cmd-S automation) was left out;
-Claude asks the user to press Cmd-S instead, which saves in place. Phase 2 differs from the plan in one way: sample duration and sample rate are not
-read from disk, because browser URIs don't give a file path. Samples get filename hints only.
+Tests: 52 offline. In Live 12.4.7, `tests/test_tracks_live.py`, `tests/test_search_live.py`,
+`tests/test_projects_live.py` and `tests/test_reconnect_live.py` pass.
+
+Two changes from this plan:
+- `save_project` (Cmd-S automation) was left out. Claude asks the user to press Cmd-S instead,
+  which saves in place.
+- Sample duration and sample rate are not read from disk, because browser URIs don't give a file
+  path. Samples get filename hints only.
 
 ## 1. Goals
 

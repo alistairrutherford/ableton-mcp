@@ -70,7 +70,12 @@ uv run livebridge ping
 ```
 
 `LIVEBRIDGE_HOST` and `LIVEBRIDGE_PORT` override the client's address. `ABLETON_MCP_PROJECTS`,
-`ABLETON_MCP_CACHE`, `LIVE_APP` and `LIVE_USER_LIBRARY` override where things are.
+`ABLETON_MCP_CACHE`, `ABLETON_MCP_LOG`, `LIVE_APP` and `LIVE_USER_LIBRARY` override where things
+are.
+
+**Log.** The server logs every tool call (arguments, time, result or error) and every reconnect to
+`~/Library/Logs/ableton-mcp/server.log`. The file rotates at 1 MB and keeps three old files.
+`ABLETON_MCP_LOG` sets another path, or `off`. Nothing goes to stdout, which carries MCP.
 
 **Claude Desktop.** Add the server to `~/Library/Application Support/Claude/claude_desktop_config.json`.
 Desktop apps don't get your shell's `PATH`, so give uv's full path (`which uv`):
@@ -87,6 +92,9 @@ Claude has only the tools' own descriptions to go on.
 
 | Symptom | Fix |
 |---|---|
+| "Live isn't running" | Start Live. |
+| "Live is running, but ClaudeLiveBridge isn't answering" | Live is starting or loading a set (try again), or ClaudeLiveBridge isn't selected as a control surface. |
+| "Live didn't answer within 15 s" | Live is busy: loading, or showing a dialog. |
 | `live_status`: "cannot connect", Remote Script installed | Live isn't running, or ClaudeLiveBridge isn't selected as a control surface. Live loads Remote Scripts only at startup. |
 | ClaudeLiveBridge isn't in Live's Control Surface list | Live hasn't restarted since the install, or the folder is missing from `User Library/Remote Scripts/`. If a symlink is ignored, reinstall it as a copy. |
 | Status bar: "ClaudeLiveBridge: port 9873 busy" | Something else holds the port. Usually a second Live instance; check with `lsof -nP -iTCP:9873`. |
@@ -109,6 +117,7 @@ uv run pytest tests/test_offline.py     # no Live needed
 uv run pytest tests/test_tracks_live.py # Phase 1 in Live: tracks, colours, instruments
 uv run pytest tests/test_search_live.py # Phase 2 in Live: index, search, load samples and devices
 uv run pytest tests/test_projects_live.py -s   # Phase 3 in Live: create, open, Cmd-S (needs you)
+uv run pytest tests/test_reconnect_live.py      # Phase 5 in Live: tools carry on across set loads
 ```
 
 Live tests take the `live` fixture from `conftest.py`, which skips them when the bridge doesn't
@@ -175,6 +184,15 @@ each direction. Several clients may connect. Requests on one connection are answ
 
 `id` is any JSON value and is echoed back. `args` is optional. Errors never close the
 connection; a line that isn't JSON gets an error reply with `id: null`.
+
+**Reconnects.** Live re-creates the control surface, and so closes every connection, on each
+set load and when it restarts. The client copes:
+
+- Before each call it drops a connection the bridge has closed (the bridge never speaks first, so
+  an idle socket with data waiting means it was closed).
+- Reconnecting waits up to 3 s for the bridge to listen again. A first connection fails at once.
+- If the connection drops after a command was sent, a read-only command (`READ_ONLY` in
+  `client.py`) is sent again. Any other command fails instead, since it may have run.
 
 **Threading.** The listener and client sockets are non-blocking and are serviced only in
 `update_display`, Live's main-thread tick (about every 100 ms). Each tick accepts, reads, runs

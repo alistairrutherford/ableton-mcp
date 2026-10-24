@@ -2,13 +2,27 @@
 
 import itertools
 import json
+import logging
 import os
+import select
 import socket
 import time
+
+log = logging.getLogger("livebridge")
 
 BRIDGE_NAME = "ClaudeLiveBridge"   # the Remote Script, as listed in Live's Control Surface menu
 DEFAULT_HOST = os.environ.get("LIVEBRIDGE_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.environ.get("LIVEBRIDGE_PORT", "9873"))
+
+# Commands that only read, so they can be sent again if the connection drops after they were sent
+# (Live re-creates the bridge on every set load, and when it restarts). Anything else might have
+# run already, so it isn't repeated.
+READ_ONLY = frozenset((
+    "ping", "list_commands", "get_state", "get_track", "list_devices", "list_parameters",
+    "get_parameter", "get_routing", "get_input_routing", "get_clip_notes", "get_meters", "get_presets",
+    "get_cpu", "browser_search", "index_status", "index_page", "index_fingerprint", "view_state",
+    "clip_slots", "lom_dir",
+))
 
 
 class BridgeError(RuntimeError):
@@ -25,21 +39,57 @@ class LiveClient:
     """One persistent connection. Each call waits for its reply.
 
     Live polls the socket about every 100 ms, so a call takes up to ~100 ms.
+
+    The connection survives Live re-creating the bridge (on every set load, and when Live restarts):
+    a call first drops a connection the bridge has closed, and reconnecting waits up to
+    `reconnect_wait` seconds for the bridge to listen again. A read-only command (READ_ONLY) whose
+    connection drops after it was sent is sent once more; any other command fails instead, since it
+    may have run.
     """
 
-    def __init__(self, host=DEFAULT_HOST, port=DEFAULT_PORT, timeout=10.0):
+    def __init__(self, host=DEFAULT_HOST, port=DEFAULT_PORT, timeout=10.0, reconnect_wait=3.0):
         self.host, self.port, self.timeout = host, port, timeout
+        self.reconnect_wait = reconnect_wait
         self._sock = None
         self._buf = b""
         self._ids = itertools.count(1)
+        self._was_connected = False
+        self.reconnects = 0
 
     # -- connection --------------------------------------------------------
 
     def connect(self):
+        """Connect if not connected. A first connection fails at once if nothing listens; a
+        reconnection waits up to `reconnect_wait` for the bridge to come back."""
         if self._sock is None:
-            self._sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
+            deadline = time.monotonic() + (self.reconnect_wait if self._was_connected else 0.0)
+            while True:
+                try:
+                    self._sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
+                    break
+                except ConnectionRefusedError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.25)
             self._buf = b""
+            if self._was_connected:
+                self.reconnects += 1
+                log.info("reconnected to %s on %s:%d", BRIDGE_NAME, self.host, self.port)
+            self._was_connected = True
         return self
+
+    def _drop_if_closed(self):
+        """The bridge never speaks first, so a readable idle socket means it was closed (Live
+        re-created the bridge, or quit): drop it so the call reconnects instead of failing."""
+        if self._sock is None or self._buf:
+            return
+        try:
+            readable, _, _ = select.select([self._sock], [], [], 0)
+            if readable and not self._sock.recv(1, socket.MSG_PEEK):
+                log.info("%s closed the connection; reconnecting", BRIDGE_NAME)
+                self.close()
+        except OSError:
+            self.close()
 
     def close(self):
         if self._sock is not None:
@@ -55,21 +105,35 @@ class LiveClient:
         self.close()
 
     def call(self, cmd, **args):
+        self._drop_if_closed()
         self.connect()
-        req_id = next(self._ids)
-        line = json.dumps({"id": req_id, "cmd": cmd, "args": args}).encode("utf-8") + b"\n"
         try:
-            self._sock.sendall(line)
-            while True:
-                resp = json.loads(self._readline())
-                if resp.get("id") == req_id:
-                    break
-        except (OSError, ValueError):
+            resp = self._exchange(cmd, args)
+        except socket.timeout:
             self.close()
             raise
+        except (OSError, ValueError) as e:
+            self.close()
+            if cmd not in READ_ONLY:
+                raise
+            log.info("connection lost during %s (%s); reconnecting and sending it again", cmd, e)
+            self.connect()
+            try:
+                resp = self._exchange(cmd, args)
+            except (OSError, ValueError):
+                self.close()
+                raise
         if not resp.get("ok"):
             raise BridgeError(cmd, resp.get("error"), resp.get("traceback"))
         return resp.get("result")
+
+    def _exchange(self, cmd, args):
+        req_id = next(self._ids)
+        self._sock.sendall(json.dumps({"id": req_id, "cmd": cmd, "args": args}).encode("utf-8") + b"\n")
+        while True:
+            resp = json.loads(self._readline())
+            if resp.get("id") == req_id:
+                return resp
 
     def _readline(self):
         while b"\n" not in self._buf:

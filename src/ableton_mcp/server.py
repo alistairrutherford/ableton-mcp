@@ -6,7 +6,12 @@ Each tool forwards to the Remote Script over localhost TCP. Tracks are 0-based i
 "master", or "return:N" for return tracks; devices and parameters are indices or names.
 """
 
+import functools
+import json
+import logging
+import logging.handlers
 import os
+import socket
 import subprocess
 import time
 from typing import Any, List, Optional, Union
@@ -36,6 +41,10 @@ DEFAULT_TRACKS = [{"kind": "midi"}, {"kind": "midi"}, {"kind": "audio"}, {"kind"
 TRACK_SPEC_KEYS = ("kind", "name", "color", "instrument", "instrument_category")
 NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 
+log = logging.getLogger("ableton_mcp")
+log.addHandler(logging.NullHandler())                    # main() adds the log file
+logging.getLogger("livebridge").addHandler(logging.NullHandler())
+
 mcp = MCPServer("ableton")
 _client = LiveClient(timeout=15.0)
 _index = None   # the browser Index, built or read from the cache on the first search
@@ -56,6 +65,20 @@ READ_ONLY = _hints(read_only_hint=True)
 DESTRUCTIVE = _hints(destructive_hint=True)
 
 
+def _unreachable(e):
+    """What to tell the user when the bridge can't be reached, by what is likely wrong."""
+    if not _live_running():
+        return ("Live isn't running. Start Live (with %s selected as a control surface), then try again."
+                % BRIDGE_NAME)
+    if isinstance(e, socket.timeout):
+        return ("Live didn't answer within %.0f s. It may be busy, loading a set or showing a dialog; "
+                "try again in a moment." % _client.timeout)
+    return ("Live is running, but %s isn't answering on %s:%d (%s). If Live has just started or is "
+            "loading a set, try again in a moment; otherwise select %s in Live's Settings > Link, Tempo "
+            "& MIDI > Control Surface. live_status says more." % (
+                BRIDGE_NAME, _client.host, _client.port, e, BRIDGE_NAME))
+
+
 def _call(cmd, **args):
     args = {k: v for k, v in args.items() if v is not None}
     try:
@@ -64,12 +87,57 @@ def _call(cmd, **args):
         raise ToolError(str(e))  # ToolError text reaches the model; other exceptions are hidden
     except OSError as e:
         _client.close()
-        raise ToolError(
-            "Cannot reach the %s control surface on %s:%d (%s). Is Live running, with %s selected "
-            "in Settings > Link, Tempo & MIDI?" % (BRIDGE_NAME, _client.host, _client.port, e, BRIDGE_NAME))
+        raise ToolError(_unreachable(e))
 
 
-@mcp.tool()
+LOG_PATH = os.path.expanduser(os.environ.get("ABLETON_MCP_LOG") or "~/Library/Logs/ableton-mcp/server.log")
+
+
+def _setup_logging(path=None):
+    """Log to a rotating file (never stdout: it carries MCP). ABLETON_MCP_LOG=off turns it off."""
+    path = path or LOG_PATH
+    if os.path.basename(path).lower() == "off":
+        return None
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    handler = logging.handlers.RotatingFileHandler(path, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    for name in ("ableton_mcp", "livebridge"):
+        logger = logging.getLogger(name)
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+    return handler
+
+
+def _brief_args(args):
+    text = json.dumps(args, default=str)
+    return text if len(text) <= 300 else text[:297] + "..."
+
+
+def tool(**kwargs):
+    """mcp.tool, logging each call: its arguments, how long it took, and how it failed."""
+    register = mcp.tool(**kwargs)
+
+    def decorate(fn):
+        @functools.wraps(fn)
+        def logged(*args, **kw):
+            t0 = time.monotonic()
+            try:
+                result = fn(*args, **kw)
+            except ToolError as e:
+                log.warning("%s %s failed after %.0f ms: %s", fn.__name__, _brief_args(kw),
+                            (time.monotonic() - t0) * 1000, e)
+                raise
+            except Exception:
+                log.exception("%s %s crashed", fn.__name__, _brief_args(kw))
+                raise
+            log.info("%s %s ok in %.0f ms", fn.__name__, _brief_args(kw), (time.monotonic() - t0) * 1000)
+            return result
+        register(logged)
+        return logged
+    return decorate
+
+
+@tool()
 def live_status() -> dict:
     """Start here. Whether Live and the bridge are up, with Live's version, tempo and track count;
     if they aren't, what to fix (install the Remote Script, start Live, select the control surface)."""
@@ -102,7 +170,7 @@ def live_status() -> dict:
     return out
 
 
-@mcp.tool()
+@tool()
 def install_remote_script(link: bool = False) -> dict:
     """Install the ClaudeLiveBridge Remote Script into Live's User Library (Remote Scripts), as a copy,
     or a symlink with link=true (for a git checkout). Replaces an earlier copy of it. Ask the user
@@ -113,37 +181,37 @@ def install_remote_script(link: bool = False) -> dict:
         raise ToolError("could not install the Remote Script: %s" % e)
 
 
-@mcp.tool()
+@tool()
 def ping() -> dict:
     """Check that Live and the bridge are up; returns Live's version."""
     return _call("ping")
 
 
-@mcp.tool()
+@tool()
 def get_state(include_devices: bool = True) -> dict:
     """Song and transport state, plus every track with its devices, arm, monitoring and routing."""
     return _call("get_state", include_devices=include_devices)
 
 
-@mcp.tool()
+@tool()
 def set_tempo(bpm: float) -> dict:
     """Set the song tempo in BPM."""
     return _call("set_tempo", bpm=bpm)
 
 
-@mcp.tool()
+@tool()
 def start_transport(from_beat: Optional[float] = None, resume: bool = False) -> dict:
     """Start playback, optionally from a song position in beats, or continue from where it stopped."""
     return _call("start_transport", from_beat=from_beat, resume=resume)
 
 
-@mcp.tool()
+@tool()
 def stop_transport() -> dict:
     """Stop playback."""
     return _call("stop_transport")
 
 
-@mcp.tool()
+@tool()
 def set_song_properties(properties: dict) -> dict:
     """Set song properties: current_song_time, loop, loop_start, loop_length (beats), metronome,
     arrangement_overdub, record_mode, session_record, signature_numerator, signature_denominator,
@@ -158,7 +226,7 @@ def _load_and_wait(name, track, category, format=None):
         raise ToolError(str(e))
     except OSError as e:
         _client.close()
-        raise ToolError("bridge not reachable: %s" % e)
+        raise ToolError(_unreachable(e))
 
 
 def _load_instrument(instrument, track, category):
@@ -183,7 +251,7 @@ def _load_instrument(instrument, track, category):
             raise ToolError(str(e))
         except OSError as e:
             _client.close()
-            raise ToolError("bridge not reachable: %s" % e)
+            raise ToolError(_unreachable(e))
     raise ToolError("no instrument named %r in %s; try browser_search" % (instrument, ", ".join(misses)))
 
 
@@ -195,7 +263,7 @@ def _brief(t):
     return out
 
 
-@mcp.tool(annotations=READ_ONLY)
+@tool(annotations=READ_ONLY)
 def list_tracks() -> dict:
     """Every track, return track and the master, with kind (midi, audio, group, return, master),
     colour, mute, solo, arm and device names. Use the index or the name to address a track;
@@ -207,7 +275,7 @@ def list_tracks() -> dict:
             "selected_track": state["selected_track"]}
 
 
-@mcp.tool()
+@tool()
 def add_track(kind: str = "midi", name: Optional[str] = None, index: int = -1,
               color: Optional[Union[int, str]] = None, instrument: Optional[str] = None,
               instrument_category: Optional[str] = None) -> dict:
@@ -249,7 +317,7 @@ def add_track(kind: str = "midi", name: Optional[str] = None, index: int = -1,
     return _call("get_track", track=track)
 
 
-@mcp.tool()
+@tool()
 def update_track(track: Key, name: Optional[str] = None, color: Optional[Union[int, str]] = None,
                  mute: Optional[bool] = None, solo: Optional[bool] = None, arm: Optional[bool] = None,
                  monitoring: Optional[str] = None) -> dict:
@@ -259,14 +327,14 @@ def update_track(track: Key, name: Optional[str] = None, color: Optional[Union[i
                  monitoring=monitoring)
 
 
-@mcp.tool()
+@tool()
 def duplicate_track(track: Key) -> dict:
     """Duplicate a track with its devices (plug-in state is saved and loaded into the copy). Not for
     return tracks or the master."""
     return _call("duplicate_track", track=track)
 
 
-@mcp.tool(annotations=DESTRUCTIVE)
+@tool(annotations=DESTRUCTIVE)
 def delete_track(track: Key) -> dict:
     """Delete a track or a return track, with its clips and devices. Live's Undo (Cmd-Z) brings it
     back; tell the user which track you are deleting."""
@@ -294,7 +362,7 @@ def _get_index(rebuild=False):
         raise ToolError("could not index Live's browser: %s" % e)
     except OSError as e:
         _client.close()
-        raise ToolError("bridge not reachable: %s" % e)
+        raise ToolError(_unreachable(e))
     built.from_cache = False
     built.save(path)
     _index = built
@@ -315,10 +383,10 @@ def _load_entry(entry, track, scene, expect):
         raise ToolError(str(e))
     except OSError as e:
         _client.close()
-        raise ToolError("bridge not reachable: %s" % e)
+        raise ToolError(_unreachable(e))
 
 
-@mcp.tool(annotations=READ_ONLY)
+@tool(annotations=READ_ONLY)
 def search(query: str, kind: str = "any", limit: int = 20, pack: Optional[str] = None) -> dict:
     """Search Live's browser for instruments, presets, samples, clips and effects.
 
@@ -340,7 +408,7 @@ def search(query: str, kind: str = "any", limit: int = 20, pack: Optional[str] =
             "index": {"entries": len(index.entries), "from_cache": getattr(index, "from_cache", None)}}
 
 
-@mcp.tool()
+@tool()
 def load_item(id: str, track: Key, scene: Optional[int] = None, keep_tempo: bool = True) -> dict:
     """Load a search result onto a track, as double-clicking it in Live's browser would.
 
@@ -377,7 +445,7 @@ def load_item(id: str, track: Key, scene: Optional[int] = None, keep_tempo: bool
     return res
 
 
-@mcp.tool()
+@tool()
 def preview_item(id: str) -> dict:
     """Play a search result through Live's browser preview (samples; some presets), to audition it.
     stop_preview stops it."""
@@ -385,13 +453,13 @@ def preview_item(id: str) -> dict:
     return _call("preview_item", id=entry["id"], root=entry["root"], path=entry["path"])
 
 
-@mcp.tool()
+@tool()
 def stop_preview() -> dict:
     """Stop the browser preview."""
     return _call("stop_preview")
 
 
-@mcp.tool()
+@tool()
 def refresh_index() -> dict:
     """Re-index Live's browser (about 10 s): after installing a pack or adding files to the User
     Library or a browser folder, if search doesn't find them."""
@@ -498,7 +566,7 @@ def _check_track_specs(tracks):
             raise ToolError("unknown track fields %s; tracks take %s" % (sorted(unknown), TRACK_SPEC_KEYS))
 
 
-@mcp.tool()
+@tool()
 def create_project(name: str, tempo: Optional[float] = None, signature: Optional[List[int]] = None,
                    template: Optional[str] = None, location: Optional[str] = None,
                    tracks: Optional[List[dict]] = None, open_in_live: bool = True) -> dict:
@@ -544,7 +612,7 @@ def create_project(name: str, tempo: Optional[float] = None, signature: Optional
     return made
 
 
-@mcp.tool()
+@tool()
 def open_project(project: str, location: Optional[str] = None) -> dict:
     """Open a project in Live: a project name (in location, default ~/Music/Ableton/Projects), a
     project folder, or a path to an .als. If the current set has unsaved changes, Live asks about
@@ -566,7 +634,7 @@ def open_project(project: str, location: Optional[str] = None) -> dict:
     return out
 
 
-@mcp.tool(annotations=READ_ONLY)
+@tool(annotations=READ_ONLY)
 def list_projects(location: Optional[str] = None) -> dict:
     """Projects in location (default ~/Music/Ableton/Projects), newest first, with their sets and
     which one is open in Live; and the templates create_project can start from."""
@@ -585,7 +653,7 @@ def list_projects(location: Optional[str] = None) -> dict:
     return out
 
 
-@mcp.tool(annotations=READ_ONLY)
+@tool(annotations=READ_ONLY)
 def get_project_info() -> dict:
     """The set open in Live: its file and project folder (none if never saved), tempo, signature,
     key, tracks, and whether one of Live's dialogs is waiting for the user."""
@@ -595,7 +663,7 @@ def get_project_info() -> dict:
         raise ToolError(str(e))
     except OSError as e:
         _client.close()
-        raise ToolError("Cannot reach the %s control surface: %s. Is Live running?" % (BRIDGE_NAME, e))
+        raise ToolError(_unreachable(e))
     path = song["file_path"] or None
     info = {
         "set_path": path, "name": song["name"] or None, "saved_to_disk": path is not None,
@@ -611,7 +679,7 @@ def get_project_info() -> dict:
     return info
 
 
-@mcp.tool()
+@tool()
 def load_device(name: str, track: Key, category: str = "plugins", format: Optional[str] = None,
                 wait: bool = True) -> dict:
     """Load a browser item by name onto a track (exact name preferred; for plugins VST3 is preferred
@@ -622,31 +690,31 @@ def load_device(name: str, track: Key, category: str = "plugins", format: Option
     return _call("load_device", name=name, track=track, category=category, format=format)
 
 
-@mcp.tool()
+@tool()
 def list_devices(track: Key) -> list:
     """Devices on a track."""
     return _call("list_devices", track=track)
 
 
-@mcp.tool()
+@tool()
 def list_parameters(track: Key, device: Key) -> dict:
     """A device's parameters with value, range and (for quantized ones) value items."""
     return _call("list_parameters", track=track, device=device)
 
 
-@mcp.tool()
+@tool()
 def set_parameter(track: Key, device: Key, parameter: Key, value: Any) -> dict:
     """Set a device parameter: a number within [min, max], true/false, or a value item name."""
     return _call("set_parameter", track=track, device=device, parameter=parameter, value=value)
 
 
-@mcp.tool()
+@tool()
 def get_routing(track: Key, direction: str = "input") -> dict:
     """Current and available routing types and channels for a track ("input" or "output")."""
     return _call("get_routing", track=track, direction=direction)
 
 
-@mcp.tool()
+@tool()
 def set_routing(track: Key, direction: str = "input", type: Optional[str] = None,
                 channel: Optional[str] = None, source_track: Optional[Key] = None) -> dict:
     """Set a track's routing type (by display name, or `source_track` for MIDI From another track),
@@ -655,7 +723,7 @@ def set_routing(track: Key, direction: str = "input", type: Optional[str] = None
                  source_track=source_track)
 
 
-@mcp.tool()
+@tool()
 def start_recording(mode: str = "arrangement", from_beat: Optional[float] = None,
                     track: Optional[Key] = None, scene: Optional[int] = None,
                     length_beats: Optional[float] = None) -> dict:
@@ -665,25 +733,25 @@ def start_recording(mode: str = "arrangement", from_beat: Optional[float] = None
                  length_beats=length_beats)
 
 
-@mcp.tool()
+@tool()
 def stop_recording(mode: str = "arrangement", stop_transport: bool = True) -> dict:
     """Stop arrangement or session recording, and by default the transport."""
     return _call("stop_recording", mode=mode, stop_transport=stop_transport)
 
 
-@mcp.tool()
+@tool()
 def clear_arrangement_clips(track: Key) -> dict:
     """Delete every arrangement clip on a track."""
     return _call("clear_arrangement_clips", track=track)
 
 
-@mcp.tool()
+@tool()
 def clear_session_clips(track: Key) -> dict:
     """Delete every clip in a track's session slots."""
     return _call("clear_session_clips", track=track)
 
 
-@mcp.tool()
+@tool()
 def get_clip_notes(track: Key, source: str = "auto", clip_index: Optional[int] = None,
                    scene: Optional[int] = None) -> dict:
     """Notes of the most recent clip on a track ("arrangement", "session" or "auto"). Arrangement
@@ -691,13 +759,13 @@ def get_clip_notes(track: Key, source: str = "auto", clip_index: Optional[int] =
     return _call("get_clip_notes", track=track, source=source, clip_index=clip_index, scene=scene)
 
 
-@mcp.tool()
+@tool()
 def get_meters(tracks: Optional[list] = None) -> list:
     """Output meter levels (0..1) of the given tracks (default all) and the master."""
     return _call("get_meters", tracks=tracks)
 
 
-@mcp.tool()
+@tool()
 def get_audio_settings() -> dict:
     """Live's current sample rate, buffer sizes and latencies, from the last "Audio In Out" block
     in its Log.txt (the Live Object Model doesn't expose them)."""
@@ -708,13 +776,16 @@ def get_audio_settings() -> dict:
     return livelog.audio_settings(version)
 
 
-@mcp.tool()
+@tool()
 def bridge_command(cmd: str, args: Optional[dict] = None) -> Any:
     """Send any bridge command by name (see the command table in README.md, or list_commands)."""
     return _call(cmd, **(args or {}))
 
 
 def main():
+    handler = _setup_logging()
+    log.info("starting: bridge %s:%d, projects %s, log %s", _client.host, _client.port,
+             projects.PROJECTS_ROOT, handler.baseFilename if handler else "off")
     mcp.run()
 
 

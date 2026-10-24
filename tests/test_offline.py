@@ -1,6 +1,9 @@
 """Tests that need no Live: the socket protocol, the commands against a fake LOM, and the timing math."""
 
+import contextlib
+import json
 import os
+import socket
 import threading
 import time
 
@@ -1096,3 +1099,237 @@ def test_create_project_stopped_by_lives_prompt_is_finished_by_open_project(live
     assert out["already_open"] is True and [t["name"] for t in out["built"]["tracks"]] == ["Lead"]
     assert out["built"]["template_tracks_removed"] == 2 and "Cmd-S" in out["save"]
     assert "built" not in server.open_project(made["set_path"])   # only once
+
+
+# -- Phase 5: reconnects, errors, tick budgets, logging ----------------------------
+
+def _bridge(port=0, world=None):
+    """A BridgeServer over the fake LOM, polled every 10 ms; returns (server, stop)."""
+    world = world or make_world()
+    srv = bridge_server.BridgeServer(world.cmds.dispatch, port=port)
+    stop = threading.Event()
+
+    def tick():
+        while not stop.is_set():
+            srv.poll()
+            time.sleep(0.01)
+    th = threading.Thread(target=tick, daemon=True)
+    th.start()
+
+    def shut():
+        stop.set()
+        th.join()
+        srv.close()
+    return srv, shut
+
+
+@contextlib.contextmanager
+def socket_free_port():
+    """A port nothing listens on."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    yield port
+
+
+def test_client_reconnects_after_the_bridge_restarts():
+    srv, shut = _bridge()
+    port = srv.address[1]
+    client = LiveClient(port=port, timeout=2.0, reconnect_wait=3.0)
+    assert client.call("ping")["pong"]
+    shut()                                               # Live re-creates the bridge (a set load)
+    time.sleep(0.1)
+    restarted = []
+
+    def come_back():
+        time.sleep(0.6)                                  # refused for a moment, like Live
+        restarted.append(_bridge(port))
+    threading.Thread(target=come_back, daemon=True).start()
+    assert client.call("create_midi_track", name="After")["name"] == "After"   # not a read: still fine,
+    assert client.reconnects == 1                        # because the stale socket is noticed first
+    restarted[0][1]()
+    client.close()
+
+
+def test_a_first_connection_fails_at_once():
+    with socket_free_port() as port:
+        client = LiveClient(port=port, timeout=1.0, reconnect_wait=3.0)
+        t0 = time.monotonic()
+        with pytest.raises(ConnectionRefusedError):
+            client.call("ping")
+        assert time.monotonic() - t0 < 0.5
+
+
+def _flaky_bridge(answer_after):
+    """A raw server that closes the first `answer_after` connections right after reading a request
+    (as when Live re-creates the bridge mid-call), then answers every request "done". Returns (port,
+    the commands it read, a stop event)."""
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(4)
+    listener.settimeout(0.2)
+    seen, stop = [], threading.Event()
+
+    def handle(conn, drop):
+        with conn, conn.makefile("rb") as lines:
+            for line in lines:
+                req = json.loads(line)
+                seen.append(req["cmd"])
+                if drop:
+                    return                                # close without answering
+                conn.sendall(json.dumps({"id": req["id"], "ok": True, "result": "done"}).encode() + b"\n")
+
+    def serve():
+        drops = answer_after
+        while not stop.is_set():
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                continue
+            handle(conn, drops > 0)
+            drops -= 1
+        listener.close()
+    threading.Thread(target=serve, daemon=True).start()
+    return listener.getsockname()[1], seen, stop
+
+
+def test_only_reads_are_sent_again_when_the_connection_drops_mid_call():
+    port, seen, stop = _flaky_bridge(answer_after=1)
+    client = LiveClient(port=port, timeout=2.0, reconnect_wait=1.0)
+    assert client.call("get_state") == "done" and seen == ["get_state", "get_state"]
+    client.close()
+    stop.set()
+
+    port, seen, stop = _flaky_bridge(answer_after=1)
+    client = LiveClient(port=port, timeout=2.0, reconnect_wait=1.0)
+    with pytest.raises(OSError):
+        client.call("create_midi_track")                 # it may have run: not repeated
+    assert seen == ["create_midi_track"]
+    assert client.call("ping") == "done"                 # and the next call reconnects
+    client.close()
+    stop.set()
+
+
+def test_a_timeout_is_not_retried():
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)                                   # accepts, never answers
+    client = LiveClient(port=listener.getsockname()[1], timeout=0.3)
+    t0 = time.monotonic()
+    with pytest.raises(socket.timeout):
+        client.call("ping")
+    assert time.monotonic() - t0 < 0.9                   # one timeout, not two
+    listener.close()
+
+
+def test_unreachable_messages_say_what_is_wrong(monkeypatch):
+    from ableton_mcp import server
+    with socket_free_port() as port:
+        monkeypatch.setattr(server, "_client", LiveClient(port=port, timeout=0.5))
+        monkeypatch.setattr(server, "_live_running", lambda: False)
+        with pytest.raises(server.ToolError, match="Live isn't running"):
+            server.get_state()
+        monkeypatch.setattr(server, "_live_running", lambda: True)
+        with pytest.raises(server.ToolError, match="Live is running, but ClaudeLiveBridge isn't answering"):
+            server.list_tracks()
+    assert "didn't answer within" in server._unreachable(socket.timeout("timed out"))
+
+
+class _Clock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+def test_the_indexer_keeps_to_its_budget_per_tick():
+    """Each node costs 1 ms on a fake clock; a 10 ms budget must give ticks of about 10 ms."""
+    clock = _Clock()
+
+    class SlowItem(BrowserItem):
+        @property
+        def iter_children(self):
+            for child in self.children:
+                clock.now += 0.001                       # reading a child from Live: 1 ms
+                yield child
+    leaves = [SlowItem("s%03d.wav" % i, loadable=True, uri="query:Samples#FileId_%d" % i) for i in range(500)]
+    browser = Obj(**{root: SlowItem(root) for root in bridge_indexer.ROOTS if root != "user_folders"})
+    browser.samples = SlowItem("Samples", leaves)        # one flat root, like Live's
+    browser.user_folders = []
+    idx = bridge_indexer.Indexer(clock=clock)
+    idx.start(browser)
+    ticks = []
+    while idx.state == "running":
+        t0 = clock.now
+        idx.step(10)
+        ticks.append((clock.now - t0) * 1000)
+    assert len(idx.entries) == 500
+    assert max(ticks) <= 11.0 + 1e-9                    # the budget, plus the one node that crosses it
+    assert len(ticks) >= 45                              # 500 ms of work really was spread out
+
+
+def test_the_socket_serves_at_most_64_commands_per_tick():
+    w = make_world()
+    srv = bridge_server.BridgeServer(w.cmds.dispatch, port=0)
+    sock = socket.create_connection(srv.address)
+    sock.sendall(b"".join(b'{"id": %d, "cmd": "ping"}\n' % i for i in range(150)))
+    time.sleep(0.1)
+    counts = []
+    received = b""
+    sock.settimeout(0.2)
+    for _ in range(4):
+        srv.poll()
+        try:
+            while True:
+                chunk = sock.recv(1 << 20)
+                if not chunk:
+                    break
+                received += chunk
+                if len(chunk) < (1 << 20):
+                    break
+        except socket.timeout:
+            pass
+        counts.append(received.count(b"\n"))
+    assert counts[:3] == [64, 128, 150]
+    sock.close()
+    srv.close()
+
+
+def test_tool_calls_and_failures_go_to_the_log(tmp_path, monkeypatch):
+    import logging
+    from ableton_mcp import server
+    handler = server._setup_logging(str(tmp_path / "logs" / "server.log"))
+    try:
+        with socket_free_port() as port:
+            monkeypatch.setattr(server, "_client", LiveClient(port=port, timeout=0.5))
+            monkeypatch.setattr(server, "_live_running", lambda: False)
+            with pytest.raises(server.ToolError):
+                server.set_tempo(bpm=97)
+        server.list_projects(location=str(tmp_path / "nowhere"))
+        handler.flush()
+        text = (tmp_path / "logs" / "server.log").read_text()
+        assert 'set_tempo {"bpm": 97} failed' in text and "Live isn't running" in text
+        assert "list_projects" in text and "ok in" in text
+        assert server._setup_logging(str(tmp_path / "off")) is None
+    finally:
+        for name in ("ableton_mcp", "livebridge"):
+            logging.getLogger(name).removeHandler(handler)
+        handler.close()
+
+
+def test_index_build_waits_for_a_walk_already_running(served):
+    from ableton_mcp.index import Index
+    client, w = served
+    client.call("index_start")                           # another MCP server started it
+    bridge_indexer.INDEX.budget_ms = 0.01
+    calls = []
+    real = client.call
+
+    def spy(cmd, **args):
+        calls.append(cmd)
+        return real(cmd, **args)
+    client.call = spy
+    idx = Index.build(client, {"live_version": "test"})
+    assert "index_start" not in calls and len(idx.entries) > 5
