@@ -4,9 +4,12 @@ Every handler runs on Live's main thread (called from the control surface's
 update tick through BridgeServer.poll). Handlers take keyword arguments from
 the request's "args" and return plain JSON data.
 
-Tracks are addressed by 0-based index, by name, or as "master". Devices and
-parameters are addressed by 0-based index or by name (exact match first,
-ignoring case, then a unique substring match).
+Tracks are addressed by 0-based index, by name, as "master", or as "return:N"
+(0-based, so "return:0" is the A return). Names are looked up among the regular
+tracks first, then the return tracks, whose names Live prefixes with their letter
+("C-Verb"): "Verb" matches it exactly. Devices and parameters are addressed by
+0-based index or by name (exact match first, ignoring case, then a unique
+substring match).
 """
 
 import re
@@ -14,6 +17,11 @@ import time
 
 MONITORING ={"in": 0, "auto": 1, "off": 2}
 MONITORING_NAMES = {v: k for k, v in MONITORING.items()}
+
+COLOR_INDEX_COUNT = 70   # Live 12's track colour palette: color_index 0..69
+
+# Live names a return track with its letter: "MCP Verb" reads back as "C-MCP Verb".
+RETURN_LETTER = re.compile(r"^[A-Z]-")
 
 BROWSER_CATEGORIES = ("plugins", "instruments", "audio_effects", "midi_effects",
                       "drums", "sounds", "max_for_live", "user_library", "packs",
@@ -94,15 +102,45 @@ class Commands:
     def _tracks(self):
         return list(self._song().tracks)
 
+    def _returns(self):
+        return list(self._song().return_tracks)
+
     def _track(self, key):
-        if isinstance(key, str) and key.strip().lower() == "master":
-            return self._song().master_track
+        if isinstance(key, str):
+            k = key.strip().lower()
+            if k == "master":
+                return self._song().master_track
+            if k.startswith("return:"):
+                try:
+                    i = int(k[len("return:"):])
+                except ValueError:
+                    raise CommandError("return tracks are addressed as return:N, got %r" % key)
+                return _match(self._returns(), i, lambda t: t.name, "return track")
+            try:
+                return _match(self._tracks(), key, lambda t: t.name, "track")
+            except CommandError as e:
+                if not str(e).startswith("no track named"):
+                    raise
+                want = RETURN_LETTER.sub("", key.strip()).lower()
+                bare = [t for t in self._returns() if RETURN_LETTER.sub("", t.name).lower() == want]
+                if bare:
+                    return bare[0]
+                try:
+                    return _match(self._returns(), key, lambda t: t.name, "return track")
+                except CommandError as e2:
+                    if not str(e2).startswith("no return track named"):
+                        raise
+                raise CommandError("no track named %r; have %s, returns %s" % (
+                    key, [t.name for t in self._tracks()], [t.name for t in self._returns()]))
         return _match(self._tracks(), key, lambda t: t.name, "track")
 
     def _track_index(self, track):
         for i, t in enumerate(self._tracks()):
             if t == track:
                 return i
+        for i, t in enumerate(self._returns()):
+            if t == track:
+                return "return:%d" % i
         return "master" if track == self._song().master_track else None
 
     def _device(self, track, key):
@@ -121,10 +159,23 @@ class Commands:
             "channel": _safe(lambda: ch.display_name),
         }
 
+    @staticmethod
+    def _kind(track, index):
+        if index == "master":
+            return "master"
+        if isinstance(index, str) and index.startswith("return:"):
+            return "return"
+        if _safe(lambda: bool(track.is_foldable), False):
+            return "group"
+        return "midi" if _safe(lambda: bool(track.has_midi_input), False) else "audio"
+
     def _track_info(self, track, index, include_devices=True):
         info = {
             "index": index,
             "name": track.name,
+            "kind": self._kind(track, index),
+            "color": _safe(lambda: "#%06x" % (int(track.color) & 0xFFFFFF)),
+            "color_index": _safe(lambda: int(track.color_index)),
             "is_midi": _safe(lambda: bool(track.has_midi_input)),
             "can_be_armed": _safe(lambda: bool(track.can_be_armed), False),
             "arm": _safe(lambda: bool(track.arm), False),
@@ -143,6 +194,7 @@ class Commands:
     def _device_info(self, d, index):
         return {
             "index": index,
+            "id": _safe(lambda: int(d._live_ptr)),   # stable while the device exists, where Live has it
             "name": d.name,
             "class_name": _safe(lambda: d.class_name),
             "class_display_name": _safe(lambda: d.class_display_name),
@@ -194,6 +246,8 @@ class Commands:
             "metronome": _safe(lambda: bool(s.metronome)),
             "midi_recording_quantization": _safe(lambda: str(s.midi_recording_quantization)),
             "tracks": [self._track_info(t, i, include_devices) for i, t in enumerate(self._tracks())],
+            "return_tracks": [self._track_info(t, "return:%d" % i, include_devices)
+                              for i, t in enumerate(self._returns())],
             "master": {
                 "output_meter_level": _safe(lambda: s.master_track.output_meter_level),
             },
@@ -270,28 +324,63 @@ class Commands:
     def cmd_create_audio_track(self, index=-1, name=None):
         return self._create_track(self._song().create_audio_track, index, name)
 
+    def cmd_create_return_track(self, name=None):
+        """Add a return track. Live always appends it after the existing returns."""
+        s = self._song()
+        s.create_return_track()
+        i = len(s.return_tracks) - 1
+        track = s.return_tracks[i]
+        if name:
+            track.name = str(name)
+        return self._track_info(track, "return:%d" % i)
+
     def cmd_duplicate_track(self, track):
         """Duplicate a track with its devices. Live saves each plug-in's state and loads it into the
         copy, so this is a state round trip without saving the set."""
         t = self._track(track)
         i = self._track_index(t)
         if not isinstance(i, int):
-            raise CommandError("cannot duplicate the master track")
+            raise CommandError("cannot duplicate the %s track (Live has no command for it)" % (
+                "master" if i == "master" else "return"))
         self._song().duplicate_track(i)
         return self._track_info(self._song().tracks[i + 1], i + 1)
 
     def cmd_delete_track(self, track):
         t = self._track(track)
         i = self._track_index(t)
-        if not isinstance(i, int):
+        s = self._song()
+        if i == "master":
             raise CommandError("cannot delete the master track")
-        self._song().delete_track(i)
-        return {"deleted": i, "track_count": len(self._song().tracks)}
+        name = t.name
+        if isinstance(i, str):
+            s.delete_return_track(int(i[len("return:"):]))
+        else:
+            s.delete_track(i)
+        return {"deleted": i, "name": name, "track_count": len(s.tracks),
+                "return_track_count": len(s.return_tracks)}
 
-    def cmd_set_track(self, track, name=None, arm=None, monitoring=None, mute=None, solo=None):
+    @staticmethod
+    def _set_color(t, color):
+        """color: a palette index 0..69 (color_index), or "#rrggbb" (Live snaps it to the palette)."""
+        if isinstance(color, bool):
+            raise CommandError("color must be a palette index or \"#rrggbb\"")
+        if isinstance(color, int):
+            if not 0 <= color < COLOR_INDEX_COUNT:
+                raise CommandError("color index must be 0..%d" % (COLOR_INDEX_COUNT - 1))
+            t.color_index = color
+            return
+        text = str(color).strip().lstrip("#")
+        if not re.match(r"^[0-9a-fA-F]{6}$", text):
+            raise CommandError("color must be a palette index or \"#rrggbb\", got %r" % (color,))
+        t.color = int(text, 16)
+
+    def cmd_set_track(self, track, name=None, arm=None, monitoring=None, mute=None, solo=None,
+                      color=None):
         t = self._track(track)
         if name is not None:
             t.name = str(name)
+        if color is not None:
+            self._set_color(t, color)
         if arm is not None:
             t.arm = bool(arm)
         if monitoring is not None:
@@ -410,9 +499,12 @@ class Commands:
         s.view.selected_track = t
         if scene is not None:
             s.view.highlighted_clip_slot = list(t.clip_slots)[int(scene)]
+        devices_before = [self._device_info(d, i) for i, d in enumerate(t.devices)]
         self._app().browser.load_item(hit["_item"])
-        # Live adds the device asynchronously; the client polls list_devices.
+        # Live adds the device asynchronously, and an instrument replaces the track's instrument
+        # instead of adding one: the client polls list_devices until it differs from devices_before.
         return {"track": self._track_index(t), "device_count_before": before,
+                "devices_before": devices_before,
                 "loaded": self._public(hit),
                 "other_matches": [self._public(h) for h in pool[1:]]}
 

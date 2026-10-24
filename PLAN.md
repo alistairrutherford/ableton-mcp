@@ -4,8 +4,9 @@ A Claude plugin (an MCP server, plus a skill) that lets Claude work in Ableton L
 projects, add tracks, and find and load instruments and samples. It is built on **LiveBridge**,
 the component already used by Chordism and NoteCap.
 
-Status (2026-10-24): Phase 0 is done. LiveBridge is vendored as ClaudeLiveBridge on port 9873, the uv
-project is set up, 16 offline tests pass, and all five spikes are answered (`docs/spikes.md`).
+Status (2026-10-24): Phases 0 and 1 are done. ClaudeLiveBridge runs on port 9873. The spikes are in
+`docs/spikes.md`. Return tracks, track colour, `add_track` with an instrument and the
+`load_device_and_wait` fix all work, and they pass 24 offline tests and `tests/test_tracks_live.py` in Live 12.4.7.
 
 ## 1. Goals
 

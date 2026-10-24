@@ -50,11 +50,12 @@ bigger plug-ins, add `-_PluginAutoPopulateThreshold=128` to
 ## Tests
 
 ```sh
-uv run pytest            # offline: no Live needed
+uv run pytest tests/test_offline.py     # no Live needed
+uv run pytest tests/test_tracks_live.py # Phase 1 in Live: tracks, colours, instruments
 ```
 
-Live tests will go in `tests/` too. They take the `live` fixture from `conftest.py`, which skips
-them when the bridge doesn't answer.
+Live tests take the `live` fixture from `conftest.py`, which skips them when the bridge doesn't
+answer. Run them in a scratch set: they add tracks named `MCP ...` and remove them again.
 
 ## MCP server
 
@@ -64,10 +65,21 @@ them when the bridge doesn't answer.
 {"mcpServers": {"ableton": {"command": "uv", "args": ["run", "--directory", ".", "python", "-m", "ableton_mcp"]}}}
 ```
 
-Its tools are the commands below, plus `live_status` (start here: Live's version, tempo and
-track count, or what to fix if the bridge isn't answering), `load_device` (which waits for the
-device), `get_audio_settings` (sample rate, buffer sizes and latencies from Live's log), and
-`bridge_command` (any command by name). It works with the `mcp` SDK 1.x (`FastMCP`) and 2.x
+Its tools are most of the commands below, plus:
+
+- `live_status`: start here. It gives Live's version, tempo and track count, or what to fix if
+  the bridge isn't answering.
+- `list_tracks`: tracks, return tracks and the master, with kind, colour and device names.
+- `add_track`: a MIDI, audio or return track, with a name, position, colour and (MIDI) an
+  instrument. The instrument is looked up in instruments, sounds, drums, then plugins. If it
+  can't be loaded, the track is removed again.
+- `update_track`: name, colour, mute, solo, arm, monitoring.
+- `load_device`: waits for the device and says what it replaced.
+- `get_audio_settings`: sample rate, buffer sizes and latencies from Live's log.
+- `bridge_command`: any command by name. This includes the ones `add_track` and `update_track`
+  stand in for (`create_*_track`, `set_track`, `arm_track`) and the Phase 0 probes.
+
+`delete_track` is annotated as destructive and `list_tracks` as read-only. It works with the `mcp` SDK 1.x (`FastMCP`) and 2.x
 (`MCPServer`). Claude Code asks to approve the server the first time it starts in this folder.
 
 ## Manual steps (not in the Live Object Model)
@@ -100,8 +112,14 @@ up to 64 commands and writes. So every LOM call runs on the main thread, and one
 to ~100 ms. Nothing blocks in Live. Commands that Live finishes later (loading a device) return
 straight away, and the client polls (`load_device_and_wait`).
 
-**Addressing.** `track`: 0-based index, a name, or `"master"`. `device` and `parameter`: 0-based
-index or a name. Names match exactly (ignoring case) first, then by a unique substring.
+**Addressing.** `track`: 0-based index, a name, `"master"`, or `"return:N"` (0-based: `"return:0"` is
+the A return). Names are looked up among the regular tracks first, then the returns. Live reads a
+return's name back with its letter (`"MCP Verb"` → `"C-MCP Verb"`), and the name without the
+letter matches exactly. `device` and `parameter`: 0-based index or a name. Names match exactly
+(ignoring case) first, then by a unique substring.
+
+**Colour.** `color` is a palette index 0..69 (`color_index`) or `"#rrggbb"`, which Live snaps
+to the nearest palette colour (`#ff0000` → `#ff3636`, index 14). Tracks report both.
 
 ### Commands
 
@@ -109,20 +127,21 @@ index or a name. Names match exactly (ignoring case) first, then by a unique sub
 |---|---|---|
 | `ping` | | `{pong, live_version}` |
 | `list_commands` | | command names |
-| `get_state` | `include_devices=true` | tempo, signature, is_playing, current_song_time, record_mode, session_record, is_counting_in, arrangement_overdub, loop, metronome, midi_recording_quantization, `tracks[]` (index, name, is_midi, arm, monitoring, mute, solo, input/output routing, devices), master meter, selected_track |
+| `get_state` | `include_devices=true` | tempo, signature, is_playing, current_song_time, record_mode, session_record, is_counting_in, arrangement_overdub, loop, metronome, midi_recording_quantization, `tracks[]` and `return_tracks[]` (index, name, kind, color, color_index, is_midi, arm, monitoring, mute, solo, input/output routing, devices with `id`), master meter, selected_track |
 | `set_tempo` | `bpm` | `{tempo}` |
 | `start_transport` | `from_beat?`, `resume=false` | `{is_playing, current_song_time}` |
 | `stop_transport` | | same |
 | `set_song_properties` | any of `current_song_time, loop, loop_start, loop_length, metronome, arrangement_overdub, record_mode, session_record, signature_numerator, signature_denominator, back_to_arranger, midi_recording_quantization` (`"none"` or a `RecordingQuantization` name) | the new values |
 | `create_midi_track` | `index=-1`, `name?` | the track |
 | `create_audio_track` | `index=-1`, `name?` | the track |
+| `create_return_track` | `name?` | the track (always after the existing returns) |
 | `duplicate_track` | `track` | the copy (Live saves each plug-in's state and loads it into the copy) |
-| `delete_track` | `track` | `{deleted, track_count}` |
+| `delete_track` | `track` (also a return track) | `{deleted, name, track_count, return_track_count}` |
 | `get_track` | `track` | the track |
-| `set_track` | `track`, `name? arm? monitoring? ("in"/"auto"/"off") mute? solo?` | the track |
+| `set_track` | `track`, `name? color? arm? monitoring? ("in"/"auto"/"off") mute? solo?` | the track |
 | `arm_track` | `track`, `arm=true` | `{track, arm}` |
 | `browser_search` | `query`, `category="plugins"`, `format?`, `limit=50` | `[{name, path, uri, format, exact, is_device}]` |
-| `load_device` | `name`, `track`, `category="plugins"`, `format?` | `{track, device_count_before, loaded, other_matches}`. The device appears a moment later. |
+| `load_device` | `name`, `track`, `category="plugins"`, `format?`, `scene?` (the clip slot to highlight first, where a sample goes on an audio track) | `{track, device_count_before, devices_before, loaded, other_matches}`. The device appears a moment later. An instrument replaces the track's instrument, so `load_device_and_wait` waits for the list to differ from `devices_before`. |
 | `load_plugin` | `name`, `track`, `format?` | same as `load_device` with category `plugins` |
 | `list_devices` | `track` | `[{index, name, class_name, class_display_name, type, is_active, parameter_count}]` |
 | `list_parameters` | `track`, `device` | `{device, parameters: [{index, name, value, min, max, is_quantized, is_enabled, display, value_items?}]}` |

@@ -39,6 +39,6 @@ def report():
 
 def pytest_terminal_summary(terminalreporter):
     if _REPORTS:
-        terminalreporter.section("Live timing report")
+        terminalreporter.section("Live test report")
         for block in _REPORTS:
             terminalreporter.write_line(block)

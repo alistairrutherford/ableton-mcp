@@ -43,7 +43,8 @@ class Clip(Obj):
 class Track(Obj):
     def __init__(self, name, devices=(), **kw):
         kw.setdefault("has_midi_input", True)
-        super().__init__(name=name, devices=list(devices), can_be_armed=True,
+        kw.setdefault("can_be_armed", True)
+        super().__init__(name=name, devices=list(devices), color=0x1AFF2F, color_index=0, is_foldable=False,
                          arm=False, current_monitoring_state=1, mute=False, solo=False,
                          playing_slot_index=-1, arrangement_clips=[], clip_slots=[],
                          output_meter_left=0.0, output_meter_right=0.0, output_meter_level=0.0,
@@ -57,7 +58,7 @@ class Track(Obj):
 
 class Song(Obj):
     def __init__(self, tracks):
-        super().__init__(tracks=tracks, master_track=Track("Master"), tempo=120.0,
+        super().__init__(tracks=tracks, return_tracks=[], master_track=Track("Master"), tempo=120.0,
                          signature_numerator=4, signature_denominator=4, is_playing=False,
                          current_song_time=0.0, record_mode=False, session_record=False,
                          is_counting_in=False, arrangement_overdub=False, loop=False,
@@ -80,11 +81,29 @@ class Song(Obj):
     def create_audio_track(self, index):
         self.tracks.insert(len(self.tracks) if index < 0 else index, Track("Audio", has_midi_input=False))
 
+    def create_return_track(self):
+        self.return_tracks.append(Track("Return", has_midi_input=False, can_be_armed=False))
+
+    def delete_track(self, index):
+        del self.tracks[index]
+
+    def delete_return_track(self, index):
+        del self.return_tracks[index]
+
 
 class BrowserItem(Obj):
-    def __init__(self, name, children=(), loadable=False, uri=""):
+    def __init__(self, name, children=(), loadable=False, uri="", kind=None):
         super().__init__(name=name, children=list(children), is_loadable=loadable,
-                         is_device=loadable, uri=uri)
+                         is_device=loadable, uri=uri, kind=kind)
+
+
+_ptrs = iter(range(1000, 10 ** 6))
+
+
+def device(name, kind="instrument", **kw):
+    """A fake device; `_live_ptr` is what the bridge reports as its id."""
+    return Obj(name=name, class_name=name, class_display_name=name, type=1 if kind == "instrument" else 2,
+               is_active=True, parameters=[], _live_ptr=next(_ptrs), **kw)
 
 
 def make_world():
@@ -112,14 +131,40 @@ def make_world():
                 BrowserItem("TestSynth", loadable=True, uri="query:Plugins#VST3:x"),
                 BrowserItem("TestSynth Helper", loadable=True)])]),
         ]),
-        instruments=BrowserItem("Instruments", [BrowserItem("Drift", loadable=True)]),
+        instruments=BrowserItem("Instruments", [BrowserItem("Drift", loadable=True, kind="instrument")]),
+        sounds=BrowserItem("Sounds", [BrowserItem("Pads", [
+            BrowserItem("Attack Pad.adv", loadable=True, kind="instrument")])]),
+        drums=BrowserItem("Drums"),
+        audio_effects=BrowserItem("Audio Effects", [BrowserItem("Reverb", loadable=True, kind="effect")]),
         load_item=loaded.append,
     )
     app = Obj(browser=browser, get_major_version=lambda: 12, get_minor_version=lambda: 4,
               get_bugfix_version=lambda: 6)
     cmds = bridge_commands.Commands(lambda: song, lambda: app)
-    return Obj(song=song, app=app, cmds=cmds, src=src, rec=rec, plugin=plugin, loaded=loaded,
-               test_chords=test_chords, port_type=port_type)
+    world = Obj(song=song, app=app, cmds=cmds, src=src, rec=rec, plugin=plugin, loaded=loaded,
+                test_chords=test_chords, port_type=port_type, pending=[])
+
+    def apply_loads():
+        """Like Live: a load lands a few ticks later on the selected track, and an instrument
+        replaces the track's instrument instead of adding one."""
+        while loaded:
+            world.pending.append([3, loaded.pop(0), song.view.selected_track])
+        for job in list(world.pending):
+            job[0] -= 1
+            if job[0] > 0:
+                continue
+            world.pending.remove(job)
+            _, item, track = job
+            kind = item.kind or "instrument"
+            dev = device(item.name.rsplit(".", 1)[0], kind)
+            old = [i for i, d in enumerate(track.devices) if d.type == 1]
+            if kind == "instrument" and old:
+                track.devices[old[0]] = dev
+            else:
+                track.devices.append(dev)
+
+    world.apply_loads = apply_loads
+    return world
 
 
 # -- protocol ----------------------------------------------------------------
@@ -134,6 +179,7 @@ def served():
     def tick():
         while not stop.is_set():
             srv.poll()
+            world.apply_loads()
             time.sleep(0.01)
 
     th = threading.Thread(target=tick, daemon=True)
@@ -380,3 +426,122 @@ def test_live_status_down_says_what_to_fix(tmp_path, monkeypatch):
     (tmp_path / "ClaudeLiveBridge").mkdir()
     status = server.live_status()
     assert status["remote_script_installed"] is True and "Control Surface" in status["fix"]
+
+
+# -- Phase 1: return tracks, colour, loading, add_track ----------------------------
+
+def test_return_tracks():
+    w = make_world()
+    t = w.cmds.dispatch("create_return_track", {"name": "Verb"})
+    assert t["index"] == "return:0" and t["kind"] == "return" and w.song.return_tracks[0].name == "Verb"
+    w.cmds.dispatch("create_return_track", {})
+    assert w.cmds.dispatch("get_track", {"track": "Verb"})["index"] == "return:0"   # by name
+    assert w.cmds.dispatch("get_track", {"track": "return:1"})["name"] == "Return"
+    state = w.cmds.dispatch("get_state", {})
+    assert [r["name"] for r in state["return_tracks"]] == ["Verb", "Return"]
+    assert [t["kind"] for t in state["tracks"]] == ["midi", "midi"]
+    with pytest.raises(bridge_commands.CommandError, match="return"):
+        w.cmds.dispatch("duplicate_track", {"track": "return:0"})
+    with pytest.raises(bridge_commands.CommandError, match="out of range"):
+        w.cmds.dispatch("get_track", {"track": "return:5"})
+    with pytest.raises(bridge_commands.CommandError, match="returns"):
+        w.cmds.dispatch("get_track", {"track": "nope"})   # the error lists both kinds
+    res = w.cmds.dispatch("delete_track", {"track": "Verb"})
+    assert res == {"deleted": "return:0", "name": "Verb", "track_count": 2, "return_track_count": 1}
+    with pytest.raises(bridge_commands.CommandError, match="master"):
+        w.cmds.dispatch("delete_track", {"track": "master"})
+
+
+def test_return_tracks_match_without_their_letter():
+    w = make_world()
+    for name in ("C-Verb Long", "D-Verb"):   # as Live reads them back
+        w.cmds.dispatch("create_return_track", {"name": name})
+    assert w.cmds.dispatch("get_track", {"track": "Verb"})["name"] == "D-Verb"   # not ambiguous
+    assert w.cmds.dispatch("get_track", {"track": "D-Verb"})["index"] == "return:1"
+    assert w.cmds.dispatch("get_track", {"track": "long"})["name"] == "C-Verb Long"
+
+
+def test_regular_tracks_win_name_lookups_over_returns():
+    w = make_world()
+    w.cmds.dispatch("create_return_track", {"name": "Synth Src"})
+    assert w.cmds.dispatch("get_track", {"track": "Synth Src"})["index"] == 0
+
+
+def test_track_colour():
+    w = make_world()
+    t = w.cmds.dispatch("set_track", {"track": 0, "color": 12})
+    assert w.src.color_index == 12 and t["color_index"] == 12
+    t = w.cmds.dispatch("set_track", {"track": 0, "color": "#FF8000"})
+    assert w.src.color == 0xFF8000 and t["color"] == "#ff8000"
+    for bad in ("red", 70, -1, True):
+        with pytest.raises(bridge_commands.CommandError, match="color"):
+            w.cmds.dispatch("set_track", {"track": 0, "color": bad})
+
+
+def test_load_device_reports_devices_before_and_ids():
+    w = make_world()
+    w.rec.devices = [device("Simpler")]
+    res = w.cmds.dispatch("load_device", {"name": "Drift", "track": 1, "category": "instruments"})
+    assert [d["name"] for d in res["devices_before"]] == ["Simpler"]
+    assert res["devices_before"][0]["id"] == w.rec.devices[0]._live_ptr
+    assert w.cmds.dispatch("list_devices", {"track": 0})[0]["id"] is None   # no _live_ptr: no id
+
+
+def test_load_device_and_wait_sees_a_replaced_instrument(served):
+    """The Phase 0 bug: an instrument replaces the track's instrument, so the count stays at 1."""
+    client, w = served
+    w.rec.devices = [device("Simpler")]
+    info = client.load_device_and_wait("Drift", 1, "instruments", timeout=5)
+    assert info["name"] == "Drift" and info["replaced"]["name"] == "Simpler"
+    assert [d.name for d in w.rec.devices] == ["Drift"]
+    # an effect is added after it, and replaces nothing
+    info = client.load_device_and_wait("Reverb", 1, "audio_effects", timeout=5)
+    assert info["name"] == "Reverb" and info["index"] == 1 and info["replaced"] is None
+    # an identical instrument replacing another is still seen, by id
+    info = client.load_device_and_wait("Drift", 1, "instruments", timeout=5)
+    assert info["name"] == "Drift" and info["replaced"]["name"] == "Drift"
+
+
+def test_add_track_with_instrument_colour_and_rollback(served, monkeypatch):
+    from ableton_mcp import server
+    client, w = served
+    monkeypatch.setattr(server, "_client", client)
+    t = server.add_track(kind="midi", name="Lead", color=5, instrument="Attack Pad")
+    assert t["name"] == "Lead" and t["kind"] == "midi" and t["color_index"] == 5
+    assert t["instrument"]["name"] == "Attack Pad"   # found in sounds, after missing in instruments
+    assert [d["name"] for d in t["devices"]] == ["Attack Pad"]
+
+    count = len(w.song.tracks)
+    with pytest.raises(server.ToolError, match="no instrument named 'Nope'.*removed again"):
+        server.add_track(name="Broken", instrument="Nope")
+    assert len(w.song.tracks) == count                       # rolled back
+    with pytest.raises(server.ToolError, match="color.*"):
+        server.add_track(name="Badly coloured", color="red")
+    assert len(w.song.tracks) == count
+    with pytest.raises(server.ToolError, match="MIDI tracks"):
+        server.add_track(kind="audio", instrument="Drift")
+    with pytest.raises(server.ToolError, match="kind"):
+        server.add_track(kind="group")
+
+    r = server.add_track(kind="return", name="Verb", color="#0000ff")
+    assert r["index"] == "return:0" and r["color"] == "#0000ff"
+    with pytest.raises(server.ToolError, match="after the existing"):
+        server.add_track(kind="return", index=0)
+    a = server.add_track(kind="audio", name="Guitar", index=0)
+    assert a["index"] == 0 and a["kind"] == "audio"
+
+
+def test_list_and_update_tracks(served, monkeypatch):
+    from ableton_mcp import server
+    client, w = served
+    monkeypatch.setattr(server, "_client", client)
+    server.add_track(kind="return", name="Verb")
+    server.update_track("Synth Src", name="Bass", color=20, mute=True)
+    listed = server.list_tracks()
+    assert listed["tracks"][0] == {"index": 0, "name": "Bass", "kind": "midi", "color": "#1aff2f",
+                                   "color_index": 20, "mute": True, "solo": False, "arm": False,
+                                   "devices": ["TestSynth"]}
+    assert [r["name"] for r in listed["return_tracks"]] == ["Verb"]
+    assert listed["master"]["kind"] == "master"
+    deleted = server.delete_track("return:0")
+    assert deleted["name"] == "Verb" and deleted["return_track_count"] == 0

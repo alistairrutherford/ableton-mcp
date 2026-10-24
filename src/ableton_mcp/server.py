@@ -2,8 +2,8 @@
 
     uv run python -m ableton_mcp
 
-Each tool forwards to the Remote Script over localhost TCP. Tracks are 0-based indices or
-names ("master" for the master track); devices and parameters are indices or names.
+Each tool forwards to the Remote Script over localhost TCP. Tracks are 0-based indices, names,
+"master", or "return:N" for return tracks; devices and parameters are indices or names.
 """
 
 import os
@@ -15,6 +15,7 @@ try:  # mcp 2.x
 except ImportError:  # mcp 1.x
     from mcp.server.fastmcp import FastMCP as MCPServer
     from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import ToolAnnotations
 
 from livebridge import livelog
 from livebridge.client import BRIDGE_NAME, BridgeError, LiveClient
@@ -24,8 +25,24 @@ Key = Union[int, str]
 REMOTE_SCRIPTS = os.path.join(os.environ.get("LIVE_USER_LIBRARY", os.path.expanduser("~/Music/Ableton/User Library")),
                               "Remote Scripts")
 
+# Where add_track looks for an instrument given by name, in order.
+INSTRUMENT_CATEGORIES = ("instruments", "sounds", "drums", "plugins")
+
 mcp = MCPServer("ableton")
 _client = LiveClient(timeout=15.0)
+
+
+def _hints(**hints):
+    """ToolAnnotations from snake_case hints (mcp 2.x field names), or their camelCase 1.x names."""
+    try:
+        return ToolAnnotations(**hints)
+    except Exception:
+        return ToolAnnotations(**{k.split("_")[0] + "".join(w.title() for w in k.split("_")[1:]): v
+                                  for k, v in hints.items()})
+
+
+READ_ONLY = _hints(read_only_hint=True)
+DESTRUCTIVE = _hints(destructive_hint=True)
 
 
 def _call(cmd, **args):
@@ -104,49 +121,128 @@ def set_song_properties(properties: dict) -> dict:
     return _call("set_song_properties", **properties)
 
 
-@mcp.tool()
-def create_midi_track(index: int = -1, name: Optional[str] = None) -> dict:
-    """Create a MIDI track at index (-1 = at the end), optionally named."""
-    return _call("create_midi_track", index=index, name=name)
+def _load_and_wait(name, track, category, format=None):
+    try:
+        return _client.load_device_and_wait(name, track, category, format)
+    except (BridgeError, TimeoutError) as e:
+        raise ToolError(str(e))
+    except OSError as e:
+        _client.close()
+        raise ToolError("bridge not reachable: %s" % e)
+
+
+def _load_instrument(instrument, track, category):
+    """Load `instrument` from `category`, or from the first of INSTRUMENT_CATEGORIES that has it."""
+    if category:
+        return _load_and_wait(instrument, track, category)
+    misses = []
+    for cat in INSTRUMENT_CATEGORIES:
+        try:
+            return _client.load_device_and_wait(instrument, track, cat)
+        except BridgeError as e:
+            if "nothing named" not in str(e):
+                raise ToolError(str(e))  # ambiguous, or a real failure: stop here
+            misses.append(cat)
+        except TimeoutError as e:
+            raise ToolError(str(e))
+        except OSError as e:
+            _client.close()
+            raise ToolError("bridge not reachable: %s" % e)
+    raise ToolError("no instrument named %r in %s; try browser_search" % (instrument, ", ".join(misses)))
+
+
+def _brief(t):
+    """A track as list_tracks shows it."""
+    out = {k: t.get(k) for k in ("index", "name", "kind", "color", "color_index", "mute", "solo", "arm")}
+    if "devices" in t:
+        out["devices"] = [d["name"] for d in t["devices"]]
+    return out
+
+
+@mcp.tool(annotations=READ_ONLY)
+def list_tracks() -> dict:
+    """Every track, return track and the master, with kind (midi, audio, group, return, master),
+    colour, mute, solo, arm and device names. Use the index or the name to address a track;
+    return tracks are "return:0", "return:1", ..."""
+    state = _call("get_state", include_devices=True)
+    return {"tracks": [_brief(t) for t in state["tracks"]],
+            "return_tracks": [_brief(t) for t in state["return_tracks"]],
+            "master": _brief(_call("get_track", track="master")),
+            "selected_track": state["selected_track"]}
 
 
 @mcp.tool()
-def create_audio_track(index: int = -1, name: Optional[str] = None) -> dict:
-    """Create an audio track at index (-1 = at the end), optionally named."""
-    return _call("create_audio_track", index=index, name=name)
+def add_track(kind: str = "midi", name: Optional[str] = None, index: int = -1,
+              color: Optional[Union[int, str]] = None, instrument: Optional[str] = None,
+              instrument_category: Optional[str] = None) -> dict:
+    """Add a track and return it.
+
+    kind: "midi", "audio" or "return". index: where it goes (-1 = at the end); return tracks always
+    go after the existing returns. color: a palette index 0..69 or "#rrggbb" (Live picks the nearest
+    palette colour). instrument (MIDI tracks only): a browser name such as "Drift" or a preset
+    such as "Attack Pad", looked up in instruments, sounds, drums, then plugins, unless
+    instrument_category says where. If the instrument can't be loaded, the new track is removed again.
+    """
+    kind = kind.strip().lower()
+    if kind not in ("midi", "audio", "return"):
+        raise ToolError("kind must be midi, audio or return")
+    if instrument and kind != "midi":
+        raise ToolError("instruments go on MIDI tracks; use kind=\"midi\" (or load_device for effects)")
+    if kind == "return":
+        if index != -1:
+            raise ToolError("Live always adds return tracks after the existing ones; leave index at -1")
+        info = _call("create_return_track", name=name)
+    else:
+        info = _call("create_%s_track" % kind, index=index, name=name)
+    track = info["index"]
+    if color is not None:
+        try:
+            _call("set_track", track=track, color=color)
+        except ToolError:
+            _call("delete_track", track=track)
+            raise
+    if instrument:
+        try:
+            device = _load_instrument(instrument, track, instrument_category)
+        except ToolError as e:
+            _call("delete_track", track=track)
+            raise ToolError("%s (the new track was removed again)" % e)
+        info = _call("get_track", track=track)
+        info["instrument"] = device
+        return info
+    return _call("get_track", track=track)
+
+
+@mcp.tool()
+def update_track(track: Key, name: Optional[str] = None, color: Optional[Union[int, str]] = None,
+                 mute: Optional[bool] = None, solo: Optional[bool] = None, arm: Optional[bool] = None,
+                 monitoring: Optional[str] = None) -> dict:
+    """Rename a track or set its colour (palette index 0..69 or "#rrggbb"), mute, solo, arm, or
+    monitoring ("in", "auto", "off")."""
+    return _call("set_track", track=track, name=name, color=color, mute=mute, solo=solo, arm=arm,
+                 monitoring=monitoring)
 
 
 @mcp.tool()
 def duplicate_track(track: Key) -> dict:
-    """Duplicate a track with its devices (plug-in state is saved and loaded into the copy)."""
+    """Duplicate a track with its devices (plug-in state is saved and loaded into the copy). Not for
+    return tracks or the master."""
     return _call("duplicate_track", track=track)
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE)
 def delete_track(track: Key) -> dict:
-    """Delete a track."""
+    """Delete a track or a return track, with its clips and devices. Live's Undo (Cmd-Z) brings it
+    back; tell the user which track you are deleting."""
     return _call("delete_track", track=track)
-
-
-@mcp.tool()
-def set_track(track: Key, name: Optional[str] = None, arm: Optional[bool] = None,
-              monitoring: Optional[str] = None, mute: Optional[bool] = None,
-              solo: Optional[bool] = None) -> dict:
-    """Rename a track or set arm, monitoring ("in", "auto", "off"), mute and solo."""
-    return _call("set_track", track=track, name=name, arm=arm, monitoring=monitoring, mute=mute, solo=solo)
-
-
-@mcp.tool()
-def arm_track(track: Key, arm: bool = True) -> dict:
-    """Arm or disarm a track for recording."""
-    return _call("arm_track", track=track, arm=arm)
 
 
 @mcp.tool()
 def browser_search(query: str, category: str = "plugins", format: Optional[str] = None,
                    limit: int = 50) -> list:
     """Search a browser tree (plugins, instruments, audio_effects, midi_effects, drums, sounds,
-    max_for_live, user_library, packs) for loadable items whose name contains `query`.
+    max_for_live, user_library, packs, samples, clips, current_project) for loadable items whose
+    name contains `query`.
     For plugins, `format` filters by vst3, au or vst."""
     return _call("browser_search", query=query, category=category, format=format, limit=limit)
 
@@ -155,15 +251,10 @@ def browser_search(query: str, category: str = "plugins", format: Optional[str] 
 def load_device(name: str, track: Key, category: str = "plugins", format: Optional[str] = None,
                 wait: bool = True) -> dict:
     """Load a browser item by name onto a track (exact name preferred; for plugins VST3 is preferred
-    over AU over VST unless `format` is given). With wait, returns the new device once it appears."""
+    over AU over VST unless `format` is given). An instrument replaces the track's instrument; an
+    effect is added. With wait, returns the new device once it appears, and what it replaced."""
     if wait:
-        try:
-            return _client.load_device_and_wait(name, track, category, format)
-        except (BridgeError, TimeoutError) as e:
-            raise ToolError(str(e))
-        except OSError as e:
-            _client.close()
-            raise ToolError("bridge not reachable: %s" % e)
+        return _load_and_wait(name, track, category, format)
     return _call("load_device", name=name, track=track, category=category, format=format)
 
 

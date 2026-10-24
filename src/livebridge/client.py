@@ -93,13 +93,26 @@ class LiveClient:
             time.sleep(interval)
 
     def load_device_and_wait(self, name, track, category="plugins", format=None, timeout=20.0):
-        """Load from the browser and wait until the device appears; returns its device info."""
+        """Load from the browser and wait until the track's devices change; returns the new device's
+        info, with `replaced` set to the device it took the place of, if any.
+
+        An effect is added to the chain, but an instrument replaces the track's instrument, so the
+        device count can stay the same: we wait for the list to differ, not to grow.
+        """
         res = self.call("load_device", name=name, track=track, category=category, format=format)
-        before = res["device_count_before"]
+        before = res["devices_before"]
+        old = [_device_key(d) for d in before]
         devices = self.wait_until(
-            lambda: (lambda d: d if len(d) > before else None)(self.call("list_devices", track=track)),
+            lambda: (lambda d: d if [_device_key(x) for x in d] != old else None)(
+                self.call("list_devices", track=track)),
             timeout, what="%s to load on track %s" % (name, track))
-        info = devices[before]
+        now = [_device_key(d) for d in devices]
+        new = [d for d, k in zip(devices, now) if k not in old]
+        if not new:  # the same devices, reordered: take the first one that moved
+            new = [d for i, (d, k) in enumerate(zip(devices, now)) if i >= len(old) or k != old[i]]
+        gone = [d for d, k in zip(before, old) if k not in now]
+        info = dict(new[0])
+        info["replaced"] = gone[0] if gone else None
         info["browser_item"] = res["loaded"]
         return info
 
@@ -129,6 +142,16 @@ class LiveClient:
         finally:
             self.call("stop_recording", mode="arrangement", stop_transport=True)
         return self.call("get_clip_notes", track=track, source="arrangement")
+
+
+def _device_key(d):
+    """What identifies a device across two list_devices calls: Live's id where the bridge has it,
+    else its name and class (so replacing a device with an identical one goes unnoticed)."""
+    if d is None:
+        return None
+    if d.get("id") is not None:
+        return ("id", d["id"])
+    return ("name", d["name"], d.get("class_name"))
 
 
 def connect(host=DEFAULT_HOST, port=DEFAULT_PORT, timeout=10.0):
