@@ -1,0 +1,14 @@
+{
+  "name": "ableton-mcp",
+  "owner": {
+    "name": "Alistair Rutherford"
+  },
+  "description": "The Ableton Live plugin from this repository",
+  "plugins": [
+    {
+      "name": "ableton-mcp",
+      "source": "./",
+      "description": "Work in Ableton Live 12: projects, tracks, and searching Live's browser for instruments and samples"
+    }
+  ]
+}

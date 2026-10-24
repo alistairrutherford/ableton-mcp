@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "ableton": {
-      "command": "uv",
-      "args": ["run", "--directory", ".", "python", "-m", "ableton_mcp"]
-    }
-  }
-}

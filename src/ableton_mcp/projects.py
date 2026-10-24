@@ -21,8 +21,9 @@ import time
 
 from livebridge import als
 
-PROJECTS_ROOT = os.path.expanduser(os.environ.get("ABLETON_MCP_PROJECTS", "~/Music/Ableton/Projects"))
-USER_LIBRARY = os.path.expanduser(os.environ.get("LIVE_USER_LIBRARY", "~/Music/Ableton/User Library"))
+# Empty values count as unset: a plugin passes an option the user left blank as "".
+PROJECTS_ROOT = os.path.expanduser(os.environ.get("ABLETON_MCP_PROJECTS") or "~/Music/Ableton/Projects")
+USER_LIBRARY = os.path.expanduser(os.environ.get("LIVE_USER_LIBRARY") or "~/Music/Ableton/User Library")
 MARKER = "Ableton Project Info"
 SUFFIX = " Project"
 

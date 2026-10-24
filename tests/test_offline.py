@@ -492,13 +492,41 @@ def test_live_status_down_says_what_to_fix(tmp_path, monkeypatch):
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
     monkeypatch.setattr(server, "_client", LiveClient(port=port, timeout=1.0))
-    monkeypatch.setattr(server, "REMOTE_SCRIPTS", str(tmp_path))
+    monkeypatch.setenv("LIVE_USER_LIBRARY", str(tmp_path))
     status = server.live_status()
     assert status["ok"] is False and status["remote_script_installed"] is False
-    assert "install_remote_script.sh" in status["fix"]
-    (tmp_path / "ClaudeLiveBridge").mkdir()
+    assert "install_remote_script" in status["fix"]
+    server.install_remote_script()
     status = server.live_status()
     assert status["remote_script_installed"] is True and "Control Surface" in status["fix"]
+
+
+def test_install_remote_script_copies_links_and_spots_stale_copies(tmp_path, monkeypatch):
+    from ableton_mcp import remote_script
+    monkeypatch.setenv("LIVE_USER_LIBRARY", str(tmp_path))
+    assert remote_script.status()["installed"] is False
+    out = remote_script.install()
+    dest = tmp_path / "Remote Scripts" / "ClaudeLiveBridge"
+    assert out["kind"] == "copy" and out["up_to_date"] is True and out["next"].startswith("Restart Live")
+    assert sorted(p.name for p in dest.iterdir()) == ["__init__.py", "commands.py", "indexer.py", "server.py"]
+    (dest / "commands.py").write_text("# an older version\n")
+    assert remote_script.status()["up_to_date"] is False
+    out = remote_script.install(link=True)
+    assert out["kind"] == "link" and out["up_to_date"] is True and dest.is_symlink()
+    assert remote_script.install()["kind"] == "copy" and not dest.is_symlink()   # back to a copy
+    (tmp_path / "Remote Scripts" / "ClaudeLiveBridge").rename(tmp_path / "moved")
+    (dest).mkdir()
+    (dest / "notes.txt").write_text("someone else's folder")
+    with pytest.raises(RuntimeError, match="leaving it alone"):
+        remote_script.install()
+
+
+def test_cli_status_and_install(tmp_path, monkeypatch, capsys):
+    import json as _json
+    from ableton_mcp.__main__ import main
+    monkeypatch.setenv("LIVE_USER_LIBRARY", str(tmp_path))
+    assert main(["install-remote-script"]) == 0
+    assert _json.loads(capsys.readouterr().out)["kind"] == "copy"
 
 
 # -- Phase 1: return tracks, colour, loading, add_track ----------------------------

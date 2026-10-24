@@ -1,0 +1,28 @@
+{
+  "name": "ableton-mcp",
+  "displayName": "Ableton Live",
+  "version": "0.1.0",
+  "description": "Work in Ableton Live 12: create and open projects, add and shape tracks, and search Live's browser for instruments, presets, samples and effects to load. Talks to Live through the ClaudeLiveBridge Remote Script.",
+  "author": {
+    "name": "Alistair Rutherford"
+  },
+  "keywords": ["ableton", "live", "music", "daw", "midi", "audio"],
+  "mcpServers": {
+    "ableton": {
+      "command": "uv",
+      "args": ["run", "--quiet", "--directory", "${CLAUDE_PLUGIN_ROOT}", "python", "-m", "ableton_mcp"],
+      "env": {
+        "UV_PROJECT_ENVIRONMENT": "${CLAUDE_PLUGIN_DATA}/venv",
+        "ABLETON_MCP_PROJECTS": "${user_config.projects_dir}"
+      }
+    }
+  },
+  "userConfig": {
+    "projects_dir": {
+      "type": "directory",
+      "title": "Projects folder",
+      "description": "Where new Live projects go (each in its own '<name> Project' folder). Leave empty for ~/Music/Ableton/Projects.",
+      "required": false
+    }
+  }
+}

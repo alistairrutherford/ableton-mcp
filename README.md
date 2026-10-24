@@ -1,6 +1,10 @@
 # ableton-mcp
 
-An MCP server that lets Claude work in Ableton Live 12. It is built on **LiveBridge**, vendored
+A Claude Code plugin that lets Claude work in Ableton Live 12: create and open projects, add and
+shape tracks, and search Live's browser for instruments, presets, samples and effects to load. It
+is an MCP server plus an `ableton-live` skill that teaches Claude the workflow.
+
+It is built on **LiveBridge**, vendored
 from NoteCap's copy (`../audio/notecap/LiveBridge`, 2026-10-24) and renamed **ClaudeLiveBridge**
 on port **9873**, so it runs alongside Chordism's bridge (9871) and NoteCap's (9872) in one Live
 session. See [PLAN.md](PLAN.md) for where this is going.
@@ -14,33 +18,84 @@ Claude ──stdio MCP──▶ ableton_mcp ──TCP 127.0.0.1:9873, JSON lines
 |---|---|
 | `RemoteScript/ClaudeLiveBridge/` | The Live control surface. `server.py` is the socket (no Live imports), `commands.py` the LOM commands. |
 | `src/livebridge/` | Python client (`client.py`), set-file editing (`als.py`), Live's `Log.txt` (`livelog.py`), note timing (`timing.py`), and a CLI (`python -m livebridge`). |
-| `src/ableton_mcp/` | The MCP server (stdio). Registered in `.mcp.json` as `ableton`. |
-| `scripts/install_remote_script.sh` | Symlinks the Remote Script into `~/Music/Ableton/User Library/Remote Scripts/`. |
+| `src/ableton_mcp/` | The MCP server (stdio): `server.py` (tools), `index.py` (browser search), `projects.py` (projects on disk), `remote_script.py` (installing the Remote Script), and a CLI (`python -m ableton_mcp ...`). |
+| `.claude-plugin/plugin.json` | The plugin: its MCP server (`ableton`) and its one option (the projects folder). |
+| `.claude-plugin/marketplace.json` | Makes this folder a one-plugin marketplace, so it can be installed. |
+| `skills/ableton-live/SKILL.md` | The skill: how Claude should use the tools, and what is left to the user. |
+| `scripts/install_remote_script.sh` | Symlinks the Remote Script into `~/Music/Ableton/User Library/Remote Scripts/` (`python -m ableton_mcp install-remote-script` does the same, copying by default). |
 | `scripts/restart_live.sh` | Quits Live and reopens it with a set, then waits for the bridge. |
 | `tests/test_offline.py` | Protocol and commands against a fake LOM, timing math, `.als` editing. No Live needed. |
 
 ## Setup
 
-Needs [uv](https://docs.astral.sh/uv/). Live 12 runs Remote Scripts on its own Python 3.11.
+You need macOS, Live 12, [uv](https://docs.astral.sh/uv/) on your `PATH`, and Claude Code. Live runs
+Remote Scripts on its own Python 3.11; the server runs on Python 3.10 or later, which uv provides.
+
+**1. Install the plugin.** This folder is a marketplace with one plugin in it:
 
 ```sh
-uv sync                              # .venv with mcp and pytest
-scripts/install_remote_script.sh     # symlink (use --copy if Live ignores the link)
+claude plugin marketplace add /path/to/ableton-mcp
+claude plugin install ableton-mcp@ableton-mcp
 ```
 
-Then restart Live and, in **Settings → Link, Tempo & MIDI → Control Surface**, pick
-**ClaudeLiveBridge** in an empty row. Leave its Input and Output on *None*. Live shows
-*"ClaudeLiveBridge listening on port 9873"* in the status bar, and the script logs to
+Or, in Claude Code, `/plugin marketplace add /path/to/ableton-mcp`, then `/plugin install
+ableton-mcp@ableton-mcp`. Claude Code asks for the plugin's one option, the **projects folder**.
+Leave it empty for `~/Music/Ableton/Projects`. The server's virtualenv goes in the plugin's data
+folder (`~/.claude/plugins/data/...`), so it survives plugin updates. To try the plugin without
+installing it, start Claude Code with `claude --plugin-dir /path/to/ableton-mcp`.
+
+**2. Install the Remote Script.** Ask Claude ("set up Ableton"): `live_status` notices that the
+Remote Script is missing, and `install_remote_script` copies it into
+`~/Music/Ableton/User Library/Remote Scripts/ClaudeLiveBridge`. Or run it yourself:
+
+```sh
+uv run --directory /path/to/ableton-mcp python -m ableton_mcp install-remote-script          # a copy
+uv run --directory /path/to/ableton-mcp python -m ableton_mcp install-remote-script --link   # a symlink, for a git checkout
+```
+
+A copy has to be reinstalled when the plugin updates. `live_status` says when it no longer
+matches.
+
+**3. Select it in Live, once.** Restart Live, since it loads Remote Scripts only at startup. In
+**Settings → Link, Tempo & MIDI → Control Surface**, pick **ClaudeLiveBridge** in an empty row and
+leave its Input and Output on *None*. Live remembers the choice. Its status bar shows
+*"ClaudeLiveBridge listening on port 9873"*, and the script logs to
 `~/Library/Preferences/Ableton/Live 12.x.x/Log.txt` (search for `ClaudeLiveBridge:`).
 
 Check it:
 
 ```sh
+uv run python -m ableton_mcp status    # the Remote Script, Live, and the projects folder
 uv run livebridge ping
-uv run livebridge get_state
 ```
 
-`LIVEBRIDGE_HOST` and `LIVEBRIDGE_PORT` override the client's address.
+`LIVEBRIDGE_HOST` and `LIVEBRIDGE_PORT` override the client's address. `ABLETON_MCP_PROJECTS`,
+`ABLETON_MCP_CACHE`, `LIVE_APP` and `LIVE_USER_LIBRARY` override where things are.
+
+**Claude Desktop.** Add the server to `~/Library/Application Support/Claude/claude_desktop_config.json`.
+Desktop apps don't get your shell's `PATH`, so give uv's full path (`which uv`):
+
+```json
+{"mcpServers": {"ableton": {"command": "/Users/you/.local/bin/uv",
+  "args": ["run", "--quiet", "--directory", "/path/to/ableton-mcp", "python", "-m", "ableton_mcp"]}}}
+```
+
+The `ableton-live` skill comes with the Claude Code plugin. Where the server runs without it,
+Claude has only the tools' own descriptions to go on.
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `live_status`: "cannot connect", Remote Script installed | Live isn't running, or ClaudeLiveBridge isn't selected as a control surface. Live loads Remote Scripts only at startup. |
+| ClaudeLiveBridge isn't in Live's Control Surface list | Live hasn't restarted since the install, or the folder is missing from `User Library/Remote Scripts/`. If a symlink is ignored, reinstall it as a copy. |
+| Status bar: "ClaudeLiveBridge: port 9873 busy" | Something else holds the port. Usually a second Live instance; check with `lsof -nP -iTCP:9873`. |
+| `live_status` says the installed Remote Script differs | Run `install_remote_script` again, then restart Live. |
+| The server doesn't start in Claude Desktop | Use uv's full path (see above). In Claude Code, `claude mcp list` shows the server's state. |
+| `search` takes about 10 s the first time | It is indexing Live's browser; afterwards it uses the cache in `~/Library/Caches/ableton-mcp/`. |
+| New packs or samples don't show up in `search` | `refresh_index`. |
+| A sample loads nowhere | It goes to a MIDI track (Simpler) or an audio track's clip slot; the load brings Session view to the front first. |
+| Live asks "Save changes…?" when a project opens | That is Live protecting the open set: answer it in Live. Then `open_project` again finishes a `create_project`. |
 
 **Plug-in parameters.** The bridge reaches a plug-in only through the parameters on Live's
 device panel, which Live fills by itself only for plug-ins with at most 64 parameters. For
@@ -61,11 +116,8 @@ answer. Run them in a scratch set: they add tracks named `MCP ...` and remove th
 
 ## MCP server
 
-`.mcp.json` registers it for Claude Code in this folder:
-
-```json
-{"mcpServers": {"ableton": {"command": "uv", "args": ["run", "--directory", ".", "python", "-m", "ableton_mcp"]}}}
-```
+The plugin runs it as `uv run --quiet --directory ${CLAUDE_PLUGIN_ROOT} python -m ableton_mcp`. To
+work on it in this folder, start Claude Code with `claude --plugin-dir .`.
 
 Its tools are most of the commands below, plus:
 
@@ -93,6 +145,7 @@ Its tools are most of the commands below, plus:
 - `get_project_info`: the open set's file, project folder, tempo, signature, key, tracks, and any
   dialog Live is showing.
 - `get_audio_settings`: sample rate, buffer sizes and latencies from Live's log.
+- `install_remote_script`: copy (or `link=true`: symlink) the Remote Script into Live's User Library.
 - `bridge_command`: any command by name. This includes the ones `add_track` and `update_track`
   stand in for (`create_*_track`, `set_track`, `arm_track`) and the Phase 0 probes.
 

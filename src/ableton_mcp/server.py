@@ -22,13 +22,11 @@ from mcp.types import ToolAnnotations
 from livebridge import livelog
 from livebridge.client import BRIDGE_NAME, BridgeError, LiveClient
 
-from . import projects
+from . import projects, remote_script
 from .index import NEEDS_MIDI, Index
 
 Key = Union[int, str]
 
-REMOTE_SCRIPTS = os.path.join(os.environ.get("LIVE_USER_LIBRARY", os.path.expanduser("~/Music/Ableton/User Library")),
-                              "Remote Scripts")
 
 # Where add_track looks for an instrument given by name, in order.
 INSTRUMENT_CATEGORIES = ("instruments", "sounds", "drums", "plugins")
@@ -76,24 +74,43 @@ def live_status() -> dict:
     """Start here. Whether Live and the bridge are up, with Live's version, tempo and track count;
     if they aren't, what to fix (install the Remote Script, start Live, select the control surface)."""
     status = {"bridge": BRIDGE_NAME, "host": _client.host, "port": _client.port}
+    script = remote_script.status()
+    status["remote_script"] = {k: script[k] for k in ("installed", "kind", "up_to_date", "path")}
+    stale = ("The installed Remote Script differs from this version's: call install_remote_script, "
+             "then restart Live." if script["installed"] and not script["up_to_date"] else None)
     try:
         ping = _client.call("ping")
         state = _client.call("get_state", include_devices=False)
     except BridgeError as e:
-        return dict(status, ok=False, error=str(e))
+        return dict(status, ok=False, error=str(e), fix=stale)
     except OSError as e:
         _client.close()
-        installed = os.path.exists(os.path.join(REMOTE_SCRIPTS, BRIDGE_NAME))
-        if not installed:
-            fix = ("The Remote Script isn't installed in %s: run scripts/install_remote_script.sh, then "
-                   "restart Live." % REMOTE_SCRIPTS)
+        if not script["installed"]:
+            fix = ("The Remote Script isn't installed: call install_remote_script (it copies it to %s), "
+                   "then restart Live and select it." % script["path"])
+        elif stale:
+            fix = stale
         else:
             fix = ("Start Live, and pick %s in an empty Control Surface row of Settings > Link, Tempo & "
                    "MIDI (Input and Output: None). Live loads Remote Scripts only at startup." % BRIDGE_NAME)
-        return dict(status, ok=False, error="cannot connect: %s" % e, remote_script_installed=installed, fix=fix)
-    return dict(status, ok=True, live_version=ping["live_version"], tempo=state["tempo"],
-                signature=state["signature"], track_count=len(state["tracks"]),
-                is_playing=state["is_playing"])
+        return dict(status, ok=False, error="cannot connect: %s" % e,
+                    remote_script_installed=script["installed"], fix=fix)
+    out = dict(status, ok=True, live_version=ping["live_version"], tempo=state["tempo"],
+               signature=state["signature"], track_count=len(state["tracks"]), is_playing=state["is_playing"])
+    if stale:
+        out["fix"] = stale
+    return out
+
+
+@mcp.tool()
+def install_remote_script(link: bool = False) -> dict:
+    """Install the ClaudeLiveBridge Remote Script into Live's User Library (Remote Scripts), as a copy,
+    or a symlink with link=true (for a git checkout). Replaces an earlier copy of it. Ask the user
+    first; Live needs a restart afterwards, and the user selects it once in Live's settings."""
+    try:
+        return remote_script.install(link=link)
+    except (OSError, RuntimeError) as e:
+        raise ToolError("could not install the Remote Script: %s" % e)
 
 
 @mcp.tool()

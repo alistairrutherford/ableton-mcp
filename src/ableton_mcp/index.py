@@ -13,7 +13,7 @@ import os
 import re
 import time
 
-CACHE_DIR = os.path.expanduser(os.environ.get("ABLETON_MCP_CACHE", "~/Library/Caches/ableton-mcp"))
+CACHE_DIR = os.path.expanduser(os.environ.get("ABLETON_MCP_CACHE") or "~/Library/Caches/ableton-mcp")
 CACHE_VERSION = 1
 
 AUDIO_EXTS = {"wav", "aif", "aiff", "flac", "mp3", "ogg", "m4a"}
