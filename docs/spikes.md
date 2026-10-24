@@ -72,7 +72,10 @@ So `open_project` can open the set, poll `file_path`, and, if a dialog is up, re
   - Core Library `Templates/8-Track Template.als`: `12.0_12402`, Creator 12.4d1;
   - a set saved by Live 12.4.6: `12.0_12402`.
   
-  So **the template must be on the running Live's schema**. Built-in sets from older builds open
+  So **the template must be on the running Live's schema**.
+- Phase 3 confirmed the signature encoding with a denominator other than 4. A project created
+  at 6/8 (value 302 = 5 + 99 × 3) opened as 6/8. Cmd-S then saved it in place, from the Core
+  Library's "Vocal Recording" template (`12.0_12402`). Built-in sets from older builds open
   fine but can't be saved in place. Don't just rewrite the header: the content would still be in
   the old schema.
 - The tempo's automation target id differs per template (8 in `DefaultLiveSet`, 845 in

@@ -8,6 +8,10 @@ The LOM has no access to a device's Sidechain chooser, but Live stores the choic
 `set_sidechain` writes that into a copy of a set, so a test can open the copy with the sidechain
 already routed. Verified in Live 12.4.6 with NoteCap's VST3 (the sidechain test passes on it).
 
+`set_tempo` and `set_time_signature` set the song's tempo and signature in a set before Live opens
+it, for new projects (docs/spikes.md §2). The master's value is in two places: the parameter's
+`Manual` value, and the first event of its automation envelope, which wins when it exists.
+
     python -m livebridge.als "path/to/set.als" --track "Vocal Comp" --source "Kick" --device "MyCompressor"
 """
 
@@ -38,6 +42,64 @@ def tracks(text):
         name = re.search(r'<EffectiveName Value="([^"]*)"', text[start:end])
         out.append((tag, tid, name.group(1) if name else "", start, end))
     return out
+
+
+def header(text):
+    """The <Ableton> element's attributes: MajorVersion, MinorVersion (the schema, e.g.
+    "12.0_12402"), SchemaChangeCount, Creator ("Ableton Live 12.4.7") and Revision."""
+    m = re.search(r"<Ableton\b([^>]*)>", text)
+    if not m:
+        raise ValueError("not a Live set: no <Ableton> element")
+    return dict(re.findall(r'(\w+)="([^"]*)"', m.group(1)))
+
+
+def schema_key(minor_version):
+    """A sortable key for a MinorVersion such as "12.0_12402": (12, 0, 12402)."""
+    return tuple(int(n) for n in re.findall(r"\d+", minor_version or "")) or (0,)
+
+
+def _set_master_param(text, tag, value, event):
+    """Set the song's <Tempo> or <TimeSignature>: its Manual value, and the initial event
+    (Time="-63072000") of the automation envelope that points at its AutomationTarget."""
+    m = re.search(r"<%s>(.*?)</%s>" % (tag, tag), text, re.S)
+    if not m:
+        raise ValueError("no <%s> in the set" % tag)
+    block = m.group(1)
+    target = re.search(r'<AutomationTarget Id="(\d+)">', block)
+    new_block, n = re.subn(r'(<Manual Value=")[^"]*(" />)', r"\g<1>%s\2" % value, block, count=1)
+    if n != 1:
+        raise ValueError("no Manual value in <%s>" % tag)
+    text = text[:m.start(1)] + new_block + text[m.end(1):]
+    if target:
+        text = re.sub(r'(<PointeeId Value="%s" />\s*</EnvelopeTarget>\s*<Automation>\s*<Events>\s*'
+                      r'<%s Id="\d+" Time="-63072000" Value=")[^"]*(")' % (target.group(1), event),
+                      r"\g<1>%s\2" % value, text, count=1)
+    return text
+
+
+def set_tempo(text, bpm):
+    bpm = float(bpm)
+    if not 20.0 <= bpm <= 999.0:
+        raise ValueError("tempo must be 20..999 BPM")
+    return _set_master_param(text, "Tempo", ("%f" % bpm).rstrip("0").rstrip("."), "FloatEvent")
+
+
+SIGNATURE_DENOMINATORS = (1, 2, 4, 8, 16)
+
+
+def time_signature_value(numerator, denominator):
+    """Live's encoding of a time signature: (numerator - 1) + 99 * log2(denominator), so 4/4 is
+    201 and 3/4 is 200 (checked by opening patched sets in Live 12.4.7)."""
+    numerator, denominator = int(numerator), int(denominator)
+    if not 1 <= numerator <= 99:
+        raise ValueError("time signature numerator must be 1..99")
+    if denominator not in SIGNATURE_DENOMINATORS:
+        raise ValueError("time signature denominator must be one of %s" % (SIGNATURE_DENOMINATORS,))
+    return (numerator - 1) + 99 * SIGNATURE_DENOMINATORS.index(denominator)
+
+
+def set_time_signature(text, numerator, denominator):
+    return _set_master_param(text, "TimeSignature", time_signature_value(numerator, denominator), "EnumEvent")
 
 
 def _track(text, name):

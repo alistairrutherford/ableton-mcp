@@ -7,7 +7,9 @@ Each tool forwards to the Remote Script over localhost TCP. Tracks are 0-based i
 """
 
 import os
-from typing import Any, Optional, Union
+import subprocess
+import time
+from typing import Any, List, Optional, Union
 
 try:  # mcp 2.x
     from mcp.server.mcpserver import MCPServer
@@ -20,6 +22,7 @@ from mcp.types import ToolAnnotations
 from livebridge import livelog
 from livebridge.client import BRIDGE_NAME, BridgeError, LiveClient
 
+from . import projects
 from .index import NEEDS_MIDI, Index
 
 Key = Union[int, str]
@@ -30,9 +33,16 @@ REMOTE_SCRIPTS = os.path.join(os.environ.get("LIVE_USER_LIBRARY", os.path.expand
 # Where add_track looks for an instrument given by name, in order.
 INSTRUMENT_CATEGORIES = ("instruments", "sounds", "drums", "plugins")
 
+# The tracks a new project gets when it starts from the Core Library base: Live's own new set.
+DEFAULT_TRACKS = [{"kind": "midi"}, {"kind": "midi"}, {"kind": "audio"}, {"kind": "audio"}]
+TRACK_SPEC_KEYS = ("kind", "name", "color", "instrument", "instrument_category")
+NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+
 mcp = MCPServer("ableton")
 _client = LiveClient(timeout=15.0)
 _index = None   # the browser Index, built or read from the cache on the first search
+_pending_builds = {}   # set path -> (track specs, replace): create_project's tracks, when Live's
+                       # save prompt stopped it opening the set; open_project finishes them
 
 
 def _hints(**hints):
@@ -369,6 +379,219 @@ def refresh_index() -> dict:
     """Re-index Live's browser (about 10 s): after installing a pack or adding files to the User
     Library or a browser folder, if search doesn't find them."""
     return _get_index(rebuild=True).stats()
+
+
+# -- projects (Phase 3) -----------------------------------------------------------
+
+def _live_running():
+    return subprocess.run(["pgrep", "-x", "Live"], capture_output=True).returncode == 0
+
+
+def _song_and_app():
+    """Song and Application attributes (file_path, name, tempo, ...; open_dialog_count, ...)."""
+    return _client.call("lom_dir", target="song"), _client.call("lom_dir", target="application")
+
+
+def _same_file(a, b):
+    return bool(a) and bool(b) and os.path.realpath(a) == os.path.realpath(b)
+
+
+def _no_dialog_in_the_way():
+    """Raise if one of Live's dialogs is up: Live won't open a set until it is answered."""
+    if not _live_running():
+        return
+    try:
+        app = _client.call("lom_dir", target="application")
+    except (OSError, BridgeError):
+        _client.close()
+        return
+    if app["open_dialog_count"]:
+        raise ToolError("Live is showing a dialog (%r); it has to be answered in Live first"
+                        % app["current_dialog_message"])
+
+
+def _open_in_live(set_path, timeout=None):
+    """Open a set in Live (launching it if needed) and wait until Live has it open. If one of Live's
+    dialogs stands in the way (it asks whether to save the current set), return what it asks
+    instead of waiting: the user answers it in Live."""
+    running = _live_running()
+    if running:
+        try:
+            song, app = _song_and_app()
+        except (OSError, BridgeError):
+            _client.close()
+            song = app = None
+        if song and _same_file(song["file_path"], set_path):
+            return {"opened": True, "already_open": True}
+        _no_dialog_in_the_way()
+    try:
+        subprocess.run(["open", "-a", projects.live_app(), set_path], check=True, capture_output=True)
+    except (subprocess.CalledProcessError, projects.ProjectError) as e:
+        raise ToolError("could not ask Live to open %s: %s" % (set_path, e))
+    deadline = time.monotonic() + (timeout or (20.0 if running else 150.0))
+    dialog_since = None
+    while time.monotonic() < deadline:
+        try:
+            song, app = _song_and_app()
+        except (OSError, BridgeError):   # Live re-creates the bridge on every set load
+            _client.close()
+            time.sleep(0.5)
+            continue
+        if _same_file(song["file_path"], set_path):
+            time.sleep(1.0)   # let Live finish loading before anything touches the set
+            return {"opened": True, "launched_live": not running}
+        if app["open_dialog_count"]:
+            dialog_since = dialog_since or time.monotonic()
+            if time.monotonic() - dialog_since > 1.0:
+                return {"opened": False, "live_is_asking": app["current_dialog_message"],
+                        "next": "The user answers this in Live (it's their choice whether to save the "
+                                "current set). Then call get_project_info to check the set opened."}
+        else:
+            dialog_since = None
+        time.sleep(0.4)
+    raise ToolError("Live didn't open %s within %.0f s" % (set_path, timeout or (20.0 if running else 150.0)))
+
+
+def _shape_tracks(specs, replace):
+    """Add `specs` (add_track arguments) as tracks; with `replace`, then delete the tracks the set
+    had before (only once at least one new track exists: a set always keeps a track)."""
+    before = [t["index"] for t in _call("get_state", include_devices=False)["tracks"]]
+    added, errors = [], []
+    for spec in specs:
+        args = {k: spec[k] for k in TRACK_SPEC_KEYS if spec.get(k) is not None}
+        try:
+            added.append(_brief(add_track(**args)))
+        except ToolError as e:
+            errors.append({"track": spec, "error": str(e)})
+    removed = 0
+    if replace and added:
+        for index in sorted(before, reverse=True):
+            _call("delete_track", track=index)
+            removed += 1
+        added = [t for t in list_tracks()["tracks"]]
+    return {"tracks": added, "errors": errors, "template_tracks_removed": removed}
+
+
+def _check_track_specs(tracks):
+    for spec in tracks or []:
+        if not isinstance(spec, dict):
+            raise ToolError("each track is an object like {\"kind\": \"midi\", \"name\": \"Keys\"}")
+        unknown = set(spec) - set(TRACK_SPEC_KEYS)
+        if unknown:
+            raise ToolError("unknown track fields %s; tracks take %s" % (sorted(unknown), TRACK_SPEC_KEYS))
+
+
+@mcp.tool()
+def create_project(name: str, tempo: Optional[float] = None, signature: Optional[List[int]] = None,
+                   template: Optional[str] = None, location: Optional[str] = None,
+                   tracks: Optional[List[dict]] = None, open_in_live: bool = True) -> dict:
+    """Make a new Live project, <location>/<name> Project/<name>.als, and open it in Live.
+
+    tempo: BPM. signature: [numerator, denominator], e.g. [3, 4]. location: the folder for projects
+    (default ~/Music/Ableton/Projects). template: a template name (the user's own, from User
+    Library/Templates, or the Core Library's: see list_projects) or a path to an .als; its tracks
+    are kept. Without one, the project starts like a new Live set, from a base whose tracks are
+    replaced. tracks: what to build, as add_track arguments ({"kind": "midi", "name": "Keys",
+    "color": 5, "instrument": "Drift"}); added after a template's tracks, or instead of the base's
+    (default: 2 MIDI and 2 audio tracks). Never touches an existing folder.
+
+    If the set open in Live has unsaved changes, Live asks about them before opening the new one:
+    the result says what it asks, and the user answers in Live. The new set is not saved after its
+    tracks are built: ask the user to press Cmd-S in Live, which saves it in place.
+    """
+    _check_track_specs(tracks)
+    if tracks and not open_in_live:
+        raise ToolError("tracks are built in Live, so they need open_in_live=true")
+    if open_in_live:
+        _no_dialog_in_the_way()   # before anything is written
+    try:
+        made = projects.create(name, location, template, tempo, signature)
+    except (projects.ProjectError, ValueError) as e:
+        raise ToolError(str(e))
+    if not open_in_live:
+        return made
+    made.update(_open_in_live(made["set_path"]))
+    if not made["opened"]:
+        if made["template_is_base"] or tracks:
+            _pending_builds[os.path.realpath(made["set_path"])] = (
+                tracks if tracks is not None else DEFAULT_TRACKS, made["template_is_base"])
+            made["next"] = ("The user answers this in Live (it's their choice whether to save the current "
+                            "set). Then call open_project(%r) to finish building the new set's tracks."
+                            % made["set_path"])
+        return made
+    if made["template_is_base"] or tracks:
+        made.update(_shape_tracks(tracks if tracks is not None else DEFAULT_TRACKS,
+                                  replace=made["template_is_base"]))
+        made["unsaved_changes"] = True
+        made["save"] = "Ask the user to press Cmd-S in Live: the set saves in place, with no dialog."
+    return made
+
+
+@mcp.tool()
+def open_project(project: str, location: Optional[str] = None) -> dict:
+    """Open a project in Live: a project name (in location, default ~/Music/Ableton/Projects), a
+    project folder, or a path to an .als. If the current set has unsaved changes, Live asks about
+    them first: the result says what it asks, and the user answers in Live."""
+    try:
+        set_path = projects.resolve_set(project, location)
+    except projects.ProjectError as e:
+        raise ToolError(str(e))
+    out = {"set_path": set_path}
+    out.update(_open_in_live(set_path))
+    pending = _pending_builds.get(os.path.realpath(set_path))
+    if out["opened"] and pending:   # create_project was stopped by Live's save prompt
+        del _pending_builds[os.path.realpath(set_path)]
+        out["built"] = _shape_tracks(*pending)
+        out["unsaved_changes"] = True
+        out["save"] = "Ask the user to press Cmd-S in Live: the set saves in place, with no dialog."
+    if out["opened"]:
+        out["project"] = get_project_info()
+    return out
+
+
+@mcp.tool(annotations=READ_ONLY)
+def list_projects(location: Optional[str] = None) -> dict:
+    """Projects in location (default ~/Music/Ableton/Projects), newest first, with their sets and
+    which one is open in Live; and the templates create_project can start from."""
+    try:
+        open_set = _song_and_app()[0]["file_path"] or None
+    except (OSError, BridgeError):
+        _client.close()
+        open_set = None
+    out = projects.list_projects(location, open_set)
+    out["open_set"] = open_set
+    try:
+        out["templates"] = [{k: t[k] for k in ("name", "where", "schema", "saves_in_place")}
+                            for t in projects.list_templates()]
+    except projects.ProjectError as e:
+        out["templates_error"] = str(e)
+    return out
+
+
+@mcp.tool(annotations=READ_ONLY)
+def get_project_info() -> dict:
+    """The set open in Live: its file and project folder (none if never saved), tempo, signature,
+    key, tracks, and whether one of Live's dialogs is waiting for the user."""
+    try:
+        song, app = _song_and_app()
+    except BridgeError as e:
+        raise ToolError(str(e))
+    except OSError as e:
+        _client.close()
+        raise ToolError("Cannot reach the %s control surface: %s. Is Live running?" % (BRIDGE_NAME, e))
+    path = song["file_path"] or None
+    info = {
+        "set_path": path, "name": song["name"] or None, "saved_to_disk": path is not None,
+        "project_dir": projects.project_of(path), "tempo": song["tempo"],
+        "signature": [song["signature_numerator"], song["signature_denominator"]],
+        "key": "%s %s" % (NOTE_NAMES[song["root_note"] % 12], song["scale_name"]) if song.get("scale_mode") else None,
+        "has_undo_history": song["can_undo"],   # changes since it was opened (saved or not)
+        "live_is_asking": app["current_dialog_message"] if app["open_dialog_count"] else None,
+    }
+    if path and info["project_dir"] is None:
+        info["note"] = "This set is not in a project folder: Live will ask where to save it."
+    info.update(list_tracks())
+    return info
 
 
 @mcp.tool()

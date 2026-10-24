@@ -1,5 +1,6 @@
 """Tests that need no Live: the socket protocol, the commands against a fake LOM, and the timing math."""
 
+import os
 import threading
 import time
 
@@ -69,6 +70,7 @@ class Track(Obj):
 class Song(Obj):
     def __init__(self, tracks):
         super().__init__(tracks=tracks, return_tracks=[], master_track=Track("Master"), tempo=120.0,
+                         file_path="", name="", can_undo=False, root_note=0, scale_name="Major", scale_mode=False,
                          signature_numerator=4, signature_denominator=4, is_playing=False,
                          current_song_time=0.0, record_mode=False, session_record=False,
                          is_counting_in=False, arrangement_overdub=False, loop=False,
@@ -185,7 +187,7 @@ def make_world():
         stop_preview=lambda: world.previews.append(None),
     )
     app = Obj(browser=browser, view=AppView(), get_major_version=lambda: 12, get_minor_version=lambda: 4,
-              get_bugfix_version=lambda: 6)
+              get_bugfix_version=lambda: 6, open_dialog_count=0, current_dialog_message="")
     cmds = bridge_commands.Commands(lambda: song, lambda: app)
     world = Obj(song=song, app=app, cmds=cmds, src=src, rec=rec, plugin=plugin, loaded=loaded,
                 test_chords=test_chords, port_type=port_type, pending=[], previews=[])
@@ -832,3 +834,237 @@ def test_mcp_search_and_load_item(served, monkeypatch):
     assert bridge_indexer.INDEX.state == "idle"
     assert server.load_item(kick, "Loops")["scene"] == 2       # found again by its path
     assert server.refresh_index()["entries"] == len(server._index.entries)
+
+
+# -- Phase 3: projects ----------------------------------------------------------------
+
+def _set_xml(schema="12.0_12402", tracks=("Vocal",), envelope=True):
+    """A minimal set with the parts create_project touches, laid out as Live 12.4 writes them."""
+    env = """<AutomationEnvelopes><Envelopes>
+<AutomationEnvelope Id="0"><EnvelopeTarget>
+<PointeeId Value="10" />
+</EnvelopeTarget><Automation><Events>
+<EnumEvent Id="0" Time="-63072000" Value="201" />
+</Events></Automation></AutomationEnvelope>
+<AutomationEnvelope Id="1"><EnvelopeTarget>
+<PointeeId Value="8" />
+</EnvelopeTarget><Automation><Events>
+<FloatEvent Id="0" Time="-63072000" Value="120" />
+</Events></Automation></AutomationEnvelope>
+</Envelopes></AutomationEnvelopes>""" if envelope else ""
+    tracks_xml = "".join('<AudioTrack Id="%d"><Name><EffectiveName Value="%s" /><UserName Value="" /></Name></AudioTrack>'
+                         % (i, n) for i, n in enumerate(tracks))
+    return ('<?xml version="1.0" encoding="UTF-8"?>\n<Ableton MajorVersion="5" MinorVersion="%s" '
+            'SchemaChangeCount="1" Creator="Ableton Live 12.4d1" Revision="x">\n<LiveSet><Tracks>%s</Tracks>'
+            '<MainTrack>%s<DeviceChain><Mixer>\n<Tempo>\n<LomId Value="0" />\n<Manual Value="120" />\n'
+            '<AutomationTarget Id="8">\n<LockEnvelope Value="0" />\n</AutomationTarget>\n</Tempo>\n'
+            '<TimeSignature>\n<LomId Value="0" />\n<Manual Value="201" />\n<AutomationTarget Id="10">\n'
+            '<LockEnvelope Value="0" />\n</AutomationTarget>\n</TimeSignature>\n</Mixer></DeviceChain>'
+            '</MainTrack></LiveSet></Ableton>\n') % (schema, tracks_xml, env)
+
+
+def _master_values(text, tag):
+    import re
+    block = re.search(r"<%s>(.*?)</%s>" % (tag, tag), text, re.S).group(1)
+    target = re.search(r'<AutomationTarget Id="(\d+)">', block).group(1)
+    ev = re.search(r'<PointeeId Value="%s" />\s*</EnvelopeTarget>\s*<Automation>\s*<Events>\s*<\w+ Id="\d+" '
+                   r'Time="-63072000" Value="([^"]*)"' % target, text)
+    return re.search(r'<Manual Value="([^"]*)"', block).group(1), ev and ev.group(1)
+
+
+def test_als_tempo_signature_and_header():
+    from livebridge import als
+    assert [als.time_signature_value(*sig) for sig in ((4, 4), (3, 4), (6, 8), (7, 8), (2, 2), (5, 16))] == \
+        [201, 200, 302, 303, 100, 400]
+    for bad in ((0, 4), (4, 3), (100, 4)):
+        with pytest.raises(ValueError):
+            als.time_signature_value(*bad)
+    x = _set_xml()
+    y = als.set_time_signature(als.set_tempo(x, 92.5), 3, 4)
+    assert _master_values(y, "Tempo") == ("92.5", "92.5") and _master_values(y, "TimeSignature") == ("200", "200")
+    assert _master_values(als.set_tempo(x, 90), "Tempo") == ("90", "90")
+    z = als.set_tempo(_set_xml(envelope=False), 140)        # no envelope: the Manual value is enough
+    assert _master_values(z, "Tempo") == ("140", None)
+    with pytest.raises(ValueError, match="tempo"):
+        als.set_tempo(x, 5)
+    h = als.header(x)
+    assert h["MinorVersion"] == "12.0_12402" and h["Creator"] == "Ableton Live 12.4d1"
+    assert als.schema_key("12.0_12117") < als.schema_key("12.0_12402")
+    with pytest.raises(ValueError, match="not a Live set"):
+        als.header("<xml/>")
+
+
+@pytest.fixture
+def live_files(tmp_path, monkeypatch):
+    """A fake Live app with Core Library templates, an empty User Library and a projects root."""
+    from livebridge import als
+    from ableton_mcp import projects
+    app = tmp_path / "Ableton Live 12 Test.app"
+    core = app / "Contents" / "App-Resources" / "Core Library" / "Templates"
+    core.mkdir(parents=True)
+    als.write(str(core / "Vocal Recording.als"), _set_xml(tracks=("Vocal",)))
+    als.write(str(core / "8-Track Template.als"), _set_xml(tracks=["%d-Audio" % i for i in range(1, 9)]))
+    user = tmp_path / "User Library"
+    (user / "Templates").mkdir(parents=True)
+    monkeypatch.setenv("LIVE_APP", str(app))
+    monkeypatch.setattr(projects, "USER_LIBRARY", str(user))
+    monkeypatch.setattr(projects, "PROJECTS_ROOT", str(tmp_path / "Projects"))
+    return Obj(app=app, core=core, user=user, root=tmp_path / "Projects")
+
+
+def test_create_project_on_disk(live_files):
+    import os
+    from livebridge import als
+    from ableton_mcp import projects
+    made = projects.create("Night Drive", tempo=92, signature=[6, 8])
+    folder = live_files.root / "Night Drive Project"
+    assert made["set_path"] == str(folder / "Night Drive.als") and made["template"] == "Vocal Recording"
+    assert made["template_is_base"] is True and "warning" not in made
+    assert (folder / "Ableton Project Info").is_dir()
+    text = als.read(made["set_path"])
+    assert _master_values(text, "Tempo") == ("92", "92") and _master_values(text, "TimeSignature") == ("302", "302")
+    with pytest.raises(projects.ProjectError, match="already exists"):
+        projects.create("Night Drive")
+    assert projects.create("Night Drive Project 2 Project")["name"] == "Night Drive Project 2"   # suffix dropped
+    for bad in ("", "  ", "a/b", "a:b", ".hidden"):
+        with pytest.raises(projects.ProjectError):
+            projects.create(bad)
+    with pytest.raises(projects.ProjectError, match="signature"):
+        projects.create("Bad Sig", signature=[4])
+    with pytest.raises(ValueError, match="denominator"):
+        projects.create("Bad Sig 2", signature=[4, 3])
+    assert not os.path.exists(live_files.root / "Bad Sig 2 Project") or \
+        not os.path.exists(live_files.root / "Bad Sig 2 Project" / "Bad Sig 2.als")
+
+
+def test_templates_by_name_user_default_and_old_schema(live_files, tmp_path):
+    from livebridge import als
+    from ableton_mcp import projects
+    made = projects.create("Eight", template="8-track")
+    assert made["template"] == "8-Track Template" and made["template_is_base"] is False
+    with pytest.raises(projects.ProjectError, match="no template 'Nope'"):
+        projects.create("X", template="Nope")
+    old = tmp_path / "Old.als"
+    als.write(str(old), _set_xml(schema="12.0_12117"))
+    made = projects.create("From Old", template=str(old))
+    assert "older than this Live's 12.0_12402" in made["warning"]
+    als.write(str(live_files.user / "Templates" / "Default Set.als"), _set_xml(tracks=("Mine",)))
+    made = projects.create("Mine Too")
+    assert made["template"] == "Default Set" and made["template_is_base"] is False   # the user's default
+    listed = {t["name"]: t for t in projects.list_templates()}
+    assert listed["Default Set"]["where"] == "user" and listed["Vocal Recording"]["saves_in_place"] is True
+
+
+def test_list_and_resolve_projects(live_files):
+    import os
+    from ableton_mcp import projects
+    assert projects.list_projects()["exists"] is False
+    a = projects.create("Alpha")
+    b = projects.create("Beta")
+    os.utime(a["set_path"], (1e9, 1e9))                       # Alpha is older
+    (live_files.root / "Not A Project").mkdir()                # no marker, no " Project", no set
+    listed = projects.list_projects(open_set=b["set_path"])
+    assert [p["name"] for p in listed["projects"]] == ["Beta", "Alpha"]
+    assert listed["projects"][0]["sets"][0]["is_open"] is True and listed["projects"][0]["has_marker"]
+    assert projects.resolve_set("Alpha") == a["set_path"]
+    assert projects.resolve_set(a["project_dir"]) == a["set_path"]
+    assert projects.resolve_set(b["set_path"]) == b["set_path"]
+    with pytest.raises(projects.ProjectError, match="no project 'Gamma'.*Alpha"):
+        projects.resolve_set("Gamma")
+    assert projects.project_of(a["set_path"]) == os.path.realpath(a["project_dir"])
+    assert projects.project_of("/tmp/loose.als") is None
+
+
+@pytest.fixture
+def live_opens(served, live_files, monkeypatch):
+    """The MCP server against the fake Live, with `open -a` loading the set the way Live does (or
+    putting up Live's save prompt, with world.dirty)."""
+    from ableton_mcp import server
+    client, w = served
+    monkeypatch.setattr(server, "_client", client)
+    monkeypatch.setattr(server, "_live_running", lambda: True)
+    w.dirty = False
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        if cmd[:2] == ["open", "-a"]:
+            if w.dirty:
+                w.app.open_dialog_count = 1
+                w.app.current_dialog_message = 'Save changes to "Untitled" before closing?'
+            else:
+                w.song.file_path = cmd[3]
+                w.song.name = os.path.splitext(os.path.basename(cmd[3]))[0]
+        return Obj(returncode=0)
+
+    import os
+    monkeypatch.setattr(server.subprocess, "run", fake_run)
+    return Obj(server=server, w=w, calls=calls, files=live_files)
+
+
+def test_create_project_opens_it_and_builds_tracks(live_opens):
+    server, w = live_opens.server, live_opens.w
+    made = server.create_project("Night Drive", tempo=92)
+    assert made["opened"] is True and made["set_path"].endswith("Night Drive Project/Night Drive.als")
+    assert live_opens.calls[-1][:3] == ["open", "-a", str(live_opens.files.app)]
+    # the base's tracks (here the fake's two) are replaced by Live's new-set layout
+    assert [t["kind"] for t in made["tracks"]] == ["midi", "midi", "audio", "audio"]
+    assert made["template_tracks_removed"] == 2 and made["unsaved_changes"] is True and "Cmd-S" in made["save"]
+
+    made = server.create_project("Keys", tracks=[{"kind": "midi", "name": "Keys", "instrument": "Drift"},
+                                                 {"kind": "audio", "name": "Vox", "color": 7},
+                                                 {"kind": "midi", "name": "Broken", "instrument": "Nope"}])
+    assert [t["name"] for t in made["tracks"]] == ["Keys", "Vox"]
+    assert made["tracks"][0]["devices"] == ["Drift"] and made["tracks"][1]["color_index"] == 7
+    assert made["errors"][0]["track"]["name"] == "Broken" and "no instrument" in made["errors"][0]["error"]
+
+    with pytest.raises(server.ToolError, match="unknown track fields"):
+        server.create_project("Typo", tracks=[{"knd": "midi"}])
+    with pytest.raises(server.ToolError, match="open_in_live"):
+        server.create_project("Closed", tracks=[{"kind": "midi"}], open_in_live=False)
+    closed = server.create_project("Closed", open_in_live=False)
+    assert "opened" not in closed and os.path.exists(closed["set_path"])
+
+    info = server.get_project_info()
+    assert info["name"] == "Keys" and info["saved_to_disk"] is True and info["project_dir"].endswith("Keys Project")
+    assert info["tempo"] == 120.0 and info["signature"] == [4, 4] and info["live_is_asking"] is None
+    listed = server.list_projects()
+    assert {p["name"] for p in listed["projects"]} == {"Night Drive", "Keys", "Closed"}
+    assert any(s["is_open"] for p in listed["projects"] for s in p["sets"] if p["name"] == "Keys")
+    assert {t["name"] for t in listed["templates"]} == {"Vocal Recording", "8-Track Template"}
+
+
+def test_open_project_reports_lives_save_prompt(live_opens):
+    server, w = live_opens.server, live_opens.w
+    server.create_project("Alpha", open_in_live=False)
+    w.dirty = True
+    out = server.open_project("Alpha")
+    assert out["opened"] is False and out["live_is_asking"] == 'Save changes to "Untitled" before closing?'
+    assert "user answers" in out["next"]
+    with pytest.raises(server.ToolError, match="answered in Live first"):
+        server.open_project("Alpha")                      # the dialog is still up
+    with pytest.raises(server.ToolError, match="answered in Live first"):
+        server.create_project("Beta")                     # checked before anything is written
+    assert not (live_opens.files.root / "Beta Project").exists()
+
+    # the user answers it in Live; then it opens
+    w.dirty = False
+    w.app.open_dialog_count, w.app.current_dialog_message = 0, ""
+    out = server.open_project("Alpha")
+    assert out["opened"] is True and out["project"]["name"] == "Alpha" and "built" not in out
+    assert server.open_project("Alpha")["already_open"] is True
+
+
+def test_create_project_stopped_by_lives_prompt_is_finished_by_open_project(live_opens):
+    server, w = live_opens.server, live_opens.w
+    w.dirty = True
+    made = server.create_project("Gamma", tracks=[{"kind": "midi", "name": "Lead"}])
+    assert made["opened"] is False and "open_project(" in made["next"]
+    # the user answers Live's prompt, and Live goes on to open the new set
+    w.dirty = False
+    w.app.open_dialog_count, w.app.current_dialog_message = 0, ""
+    w.song.file_path = made["set_path"]
+    out = server.open_project(made["set_path"])
+    assert out["already_open"] is True and [t["name"] for t in out["built"]["tracks"]] == ["Lead"]
+    assert out["built"]["template_tracks_removed"] == 2 and "Cmd-S" in out["save"]
+    assert "built" not in server.open_project(made["set_path"])   # only once

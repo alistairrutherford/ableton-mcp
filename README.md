@@ -53,6 +53,7 @@ bigger plug-ins, add `-_PluginAutoPopulateThreshold=128` to
 uv run pytest tests/test_offline.py     # no Live needed
 uv run pytest tests/test_tracks_live.py # Phase 1 in Live: tracks, colours, instruments
 uv run pytest tests/test_search_live.py # Phase 2 in Live: index, search, load samples and devices
+uv run pytest tests/test_projects_live.py -s   # Phase 3 in Live: create, open, Cmd-S (needs you)
 ```
 
 Live tests take the `live` fixture from `conftest.py`, which skips them when the bridge doesn't
@@ -84,6 +85,13 @@ Its tools are most of the commands below, plus:
 - `preview_item` / `stop_preview`: audition a search result through Live's browser preview.
 - `refresh_index`: re-index after installing a pack or adding files.
 - `load_device`: load by name instead of by id; waits for the device and says what it replaced.
+- `create_project`: makes `<location>/<name> Project/<name>.als` (default location
+  `~/Music/Ableton/Projects`, or `$ABLETON_MCP_PROJECTS`) with tempo and signature, opens it, and
+  builds its `tracks` (add_track arguments). See "Projects" below.
+- `open_project`: by name, project folder or `.als` path.
+- `list_projects`: projects newest first, which set is open, and the templates.
+- `get_project_info`: the open set's file, project folder, tempo, signature, key, tracks, and any
+  dialog Live is showing.
 - `get_audio_settings`: sample rate, buffer sizes and latencies from Live's log.
 - `bridge_command`: any command by name. This includes the ones `add_track` and `update_track`
   stand in for (`create_*_track`, `set_track`, `arm_track`) and the Phase 0 probes.
@@ -198,6 +206,26 @@ Packs (mostly legacy devices). An item is every kind it is listed as (`kind`, pl
 its folders count for ranking. Its kind comes from its root and file type. Browser items have no tags, so ranking uses, in order: the exact name, a prefix, all
 words in the name, then words in its folders or pack. A few synonyms are built in ("verb",
 "bd", "hh", "keys", ...), and close misspellings are tried when nothing matches.
+
+**Projects.** The LOM can't create, open or save a set, so `projects.py` makes the files and
+`open -a` opens them. What Live 12.4.7 needs (docs/spikes.md §1–2):
+
+- **The marker first.** `<Name> Project/Ableton Project Info/` must exist before Live opens the
+  set, or Cmd-S asks where to save it.
+- **A current-schema template.** It must be on the running Live's schema (`MinorVersion`, the
+  newest among the Core Library's templates), or Live asks to save it as a new file.
+- **Patch both values.** Tempo and signature are set in the parameter's `Manual` value and in
+  its automation envelope's first event. The signature is stored as (numerator − 1) + 99 ×
+  log₂(denominator): 4/4 = 201, 3/4 = 200, 6/8 = 302.
+
+The template is one you name (a User Library or Core Library template, or a path), else your
+`User Library/Templates/Default*.als`, else the Core Library's "Vocal Recording" as a base. When
+the base is used, its track is replaced by `tracks` (default: two MIDI, two audio) after the set
+opens. Live re-creates the bridge on every set load, so opening polls `Song.file_path` and
+reconnects. If the open set has unsaved changes, Live asks about them. `create_project` and
+`open_project` then return Live's question (`live_is_asking`) instead of waiting, and the user
+answers it in Live. `open_project` on the new set afterwards builds the tracks the prompt
+interrupted. A new set is not saved for you: Cmd-S in Live saves it in place, with no dialog.
 
 **Plug-in lookup.** `load_device` walks `application().browser.<category>` (for plugins, the
 Plug-Ins tree). It loads onto the track by selecting it and calling `browser.load_item`.
